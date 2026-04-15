@@ -74,6 +74,11 @@ GENERAL_KNOWLEDGE_HINTS = (
     "puedes decirme que es", "puedes decirme qué es", "explicame", "explícame", "define"
 )
 
+STRUCTURAL_QUERY_HINTS = (
+    "indice", "tabla de contenido", "capitulo", "seccion", "pagina",
+    "resumen", "partes", "estructura", "apartados", "contenido"
+)
+
 PLACEHOLDER_PREFIX = "documento listo para analisis de contexto masivo."
 
 missing_env = [
@@ -165,6 +170,11 @@ def should_search_knowledge_base(message: str) -> bool:
     return any(hint in normalized for hint in SEARCH_HINTS)
 
 
+def looks_like_structural_query(message: str) -> bool:
+    normalized = normalize_text(message)
+    return any(hint in normalized for hint in STRUCTURAL_QUERY_HINTS)
+
+
 def generate_once(model_name: str, payload):
     last_error = None
 
@@ -215,6 +225,21 @@ def embed_documents_with_fallback(texts: list[str]) -> list[list[float]]:
     for model_name in EMBEDDING_MODEL_CANDIDATES:
         try:
             return get_embeddings_model(model_name).embed_documents(texts)
+        except Exception as exc:
+            last_error = exc
+            if "not_found" in str(exc).lower() or "404" in str(exc):
+                continue
+            raise
+
+    raise last_error
+
+
+def embed_query_with_fallback(text: str) -> list[float]:
+    last_error = None
+
+    for model_name in EMBEDDING_MODEL_CANDIDATES:
+        try:
+            return get_embeddings_model(model_name).embed_query(text)
         except Exception as exc:
             last_error = exc
             if "not_found" in str(exc).lower() or "404" in str(exc):
@@ -573,6 +598,84 @@ def search_documents_by_text(query: str) -> list[dict]:
     return ranked[:4]
 
 
+def enrich_chunk_matches(matches: list[dict]) -> list[dict]:
+    document_ids = list({match["document_id"] for match in matches if match.get("document_id")})
+    if not document_ids:
+        return []
+
+    docs_res = (
+        supabase.table("documents")
+        .select("id,name,index_status")
+        .in_("id", document_ids)
+        .execute()
+    )
+    docs_by_id = {doc["id"]: doc for doc in (docs_res.data or [])}
+    enriched = []
+
+    for match in matches:
+        doc = docs_by_id.get(match.get("document_id"))
+        if not doc:
+            continue
+        enriched.append({
+            "id": match.get("id"),
+            "document_id": match.get("document_id"),
+            "name": doc.get("name", "Documento sin nombre"),
+            "content": match.get("content") or "",
+            "similarity": float(match.get("similarity") or 0),
+        })
+
+    return enriched
+
+
+def search_documents_semantic(query: str, match_count: int = 8) -> list[dict]:
+    query_embedding = embed_query_with_fallback(query)
+    response = supabase.rpc(
+        "match_document_chunks_hybrid",
+        {
+            "query_text": query,
+            "query_embedding": query_embedding,
+            "match_threshold": 0.12,
+            "match_count": match_count,
+            "is_structural_query": looks_like_structural_query(query),
+        },
+    ).execute()
+    return enrich_chunk_matches(response.data or [])
+
+
+def build_semantic_evidence_blocks(matches: list[dict], max_chars: int = 9000) -> str:
+    blocks = []
+    current_length = 0
+
+    for index, match in enumerate(matches, start=1):
+        content = re.sub(r"\s+", " ", match["content"]).strip()
+        block = (
+            f"Fuente {index}\n"
+            f"Documento: {match['name']}\n"
+            f"Similitud: {match['similarity']:.3f}\n"
+            f"Extracto: {content}"
+        )
+        if current_length + len(block) > max_chars:
+            break
+        blocks.append(block)
+        current_length += len(block)
+
+    return "\n\n".join(blocks)
+
+
+def dedupe_sources(matches: list[dict]) -> list[dict]:
+    seen = set()
+    sources = []
+
+    for match in matches:
+        document_id = match["document_id"]
+        if document_id in seen:
+            continue
+        seen.add(document_id)
+        sources.append({"id": document_id, "name": match["name"]})
+
+    return sources
+
+
 def build_text_search_fallback_answer(matches: list[dict], query: str) -> str:
     lines = [f"En la base documental si se encontraron coincidencias para: \"{query}\"."]
 
@@ -665,6 +768,38 @@ async def ask_document(request: ChatRequest):
                 raise
 
         if should_search_knowledge_base(request.message):
+            try:
+                semantic_matches = search_documents_semantic(request.message)
+                if semantic_matches:
+                    evidence_blocks = build_semantic_evidence_blocks(semantic_matches)
+                    response, model_name = generate_with_fallback(
+                        GENERAL_MODEL_CANDIDATES,
+                        (
+                            "Eres SIGED-IA, un asistente juridico experto. "
+                            "Responde usando solo la evidencia documental suministrada. "
+                            "No inventes datos fuera de los extractos. "
+                            "Si la evidencia es parcial o insuficiente, dilo claramente. "
+                            "Menciona los documentos fuente cuando sustenten la respuesta.\n\n"
+                            f"Pregunta del usuario: {request.message}\n\n"
+                            f"Evidencia documental recuperada por busqueda semantica/hibrida:\n{evidence_blocks}"
+                        ),
+                    )
+                    return {
+                        "answer": response.text,
+                        "model": f"{model_name} (RAG Semantico)",
+                        "sources": dedupe_sources(semantic_matches),
+                    }
+            except Exception as exc:
+                if is_quota_error(str(exc)):
+                    matches = search_documents_by_text(request.message)
+                    return {
+                        "answer": build_text_search_fallback_answer(matches, request.message) if matches else general_chat_fallback(request.message),
+                        "model": "Busqueda Textual (Respaldo local)",
+                        "sources": [{"id": item["id"], "name": item["name"]} for item in matches],
+                    }
+
+                print(f"Error en busqueda semantica, usando respaldo textual: {exc}")
+
             matches = search_documents_by_text(request.message)
             if matches:
                 if not any(match["content_match"] for match in matches):

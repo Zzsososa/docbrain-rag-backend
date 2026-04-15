@@ -1,0 +1,11 @@
+fastapi
+uvicorn
+langchain
+langchain-google-genai
+langchain-community
+supabase
+pypdf
+python-dotenv
+pydantic
+google-generativeai
+requests

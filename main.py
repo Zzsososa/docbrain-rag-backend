@@ -48,6 +48,11 @@ INDEX_BATCH_SIZE = int(os.getenv("INDEX_BATCH_SIZE", "24"))
 INDEX_MAX_PENDING = int(os.getenv("INDEX_MAX_PENDING", "3"))
 EMBEDDING_RATE_LIMIT_PAUSE_SECONDS = int(os.getenv("EMBEDDING_RATE_LIMIT_PAUSE_SECONDS", "35"))
 EMBEDDING_MAX_RETRIES = int(os.getenv("EMBEDDING_MAX_RETRIES", "4"))
+CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "1800"))
+CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "180"))
+LARGE_DOC_PAGE_THRESHOLD = int(os.getenv("LARGE_DOC_PAGE_THRESHOLD", "60"))
+LARGE_DOC_CHUNK_SIZE = int(os.getenv("LARGE_DOC_CHUNK_SIZE", "2600"))
+LARGE_DOC_CHUNK_OVERLAP = int(os.getenv("LARGE_DOC_CHUNK_OVERLAP", "220"))
 
 SPANISH_STOPWORDS = {
     "a", "al", "algo", "alguna", "alguno", "ante", "bajo", "como", "con", "contra", "cual",
@@ -336,10 +341,17 @@ def extract_document_pages(file_path: str, doc_name: str) -> list[dict]:
     return []
 
 
-def split_document_pages(pages: list[dict]) -> list[dict]:
+def get_chunk_settings(page_count: Optional[int]) -> tuple[int, int]:
+    if page_count and page_count >= LARGE_DOC_PAGE_THRESHOLD:
+        return LARGE_DOC_CHUNK_SIZE, LARGE_DOC_CHUNK_OVERLAP
+    return CHUNK_SIZE, CHUNK_OVERLAP
+
+
+def split_document_pages(pages: list[dict], page_count: Optional[int] = None) -> list[dict]:
+    chunk_size, chunk_overlap = get_chunk_settings(page_count)
     splitter = RecursiveCharacterTextSplitter(
-        chunk_size=1200,
-        chunk_overlap=160,
+        chunk_size=chunk_size,
+        chunk_overlap=chunk_overlap,
         separators=["\n\n", "\n", ". ", " ", ""],
     )
     chunks = []
@@ -460,10 +472,14 @@ def index_document_sync(document_id: str) -> None:
         update_index_status(
             document_id,
             index_progress=35,
-            index_message="Dividiendo contenido en fragmentos.",
+            index_message=(
+                "Dividiendo contenido en fragmentos amplios."
+                if page_count and page_count >= LARGE_DOC_PAGE_THRESHOLD
+                else "Dividiendo contenido en fragmentos."
+            ),
             page_count=page_count,
         )
-        chunks = split_document_pages(pages)
+        chunks = split_document_pages(pages, page_count)
 
         if not chunks:
             update_index_status(

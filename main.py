@@ -3,12 +3,18 @@ import re
 import time
 import unicodedata
 from pathlib import Path
+import tempfile
+from datetime import datetime, timezone
 import requests
-from fastapi import FastAPI, HTTPException
+from fastapi import BackgroundTasks, FastAPI, Header, HTTPException
 from pydantic import BaseModel
 from typing import Optional
 from dotenv import load_dotenv
 import google.generativeai as genai
+from docx import Document as DocxDocument
+from langchain_community.document_loaders import PyPDFLoader
+from langchain_google_genai import GoogleGenerativeAIEmbeddings
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 from supabase.client import create_client, Client
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -32,6 +38,10 @@ GENERAL_MODELS = os.getenv("GOOGLE_GENERAL_MODELS", GENERAL_MODEL)
 GOOGLE_MAX_RETRIES = int(os.getenv("GOOGLE_MAX_RETRIES", "2"))
 GOOGLE_POLL_SECONDS = int(os.getenv("GOOGLE_POLL_SECONDS", "2"))
 GOOGLE_FILE_PROCESS_TIMEOUT = int(os.getenv("GOOGLE_FILE_PROCESS_TIMEOUT", "90"))
+WORKER_SECRET = os.getenv("WORKER_SECRET")
+EMBEDDING_MODEL = os.getenv("GOOGLE_EMBEDDING_MODEL", "models/embedding-001")
+INDEX_BATCH_SIZE = int(os.getenv("INDEX_BATCH_SIZE", "24"))
+INDEX_MAX_PENDING = int(os.getenv("INDEX_MAX_PENDING", "3"))
 
 SPANISH_STOPWORDS = {
     "a", "al", "algo", "alguna", "alguno", "ante", "bajo", "como", "con", "contra", "cual",
@@ -78,6 +88,10 @@ if missing_env:
 
 genai.configure(api_key=GOOGLE_API_KEY)
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+embeddings_model = GoogleGenerativeAIEmbeddings(
+    model=EMBEDDING_MODEL,
+    google_api_key=GOOGLE_API_KEY,
+)
 
 app = FastAPI()
 
@@ -85,6 +99,12 @@ app = FastAPI()
 class ChatRequest(BaseModel):
     document_id: Optional[str] = None
     message: str
+
+
+class JobResponse(BaseModel):
+    queued: bool
+    document_id: Optional[str] = None
+    count: int = 0
 
 
 def parse_model_candidates(raw_models: str, fallback: str) -> list[str]:
@@ -175,6 +195,245 @@ def generate_with_fallback(model_names: list[str], payload):
             raise
 
     raise last_error
+
+
+def verify_worker_secret(x_worker_secret: Optional[str]) -> None:
+    if WORKER_SECRET and x_worker_secret != WORKER_SECRET:
+        raise HTTPException(status_code=401, detail="Worker no autorizado.")
+
+
+def update_index_status(document_id: str, **updates) -> None:
+    supabase.table("documents").update(updates).eq("id", document_id).execute()
+
+
+def download_document_to_temp(doc_data: dict) -> str:
+    file_path_in_storage = (doc_data.get("file_path") or "").replace("\\", "/")
+    if not file_path_in_storage:
+        raise ValueError("El documento no tiene archivo asociado en Storage.")
+
+    file_url = supabase.storage.from_("documents").get_public_url(file_path_in_storage)
+    response = requests.get(file_url, timeout=120)
+    response.raise_for_status()
+
+    temp_ext = os.path.splitext(doc_data.get("name", ""))[1] or ".bin"
+    temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=temp_ext)
+    try:
+        temp_file.write(response.content)
+        return temp_file.name
+    finally:
+        temp_file.close()
+
+
+def extract_pdf_pages(file_path: str) -> list[dict]:
+    loader = PyPDFLoader(file_path)
+    pages = loader.load()
+    extracted_pages = []
+
+    for index, page in enumerate(pages):
+        content = (page.page_content or "").strip()
+        if not content:
+            continue
+        metadata = dict(page.metadata or {})
+        metadata["page"] = metadata.get("page", index)
+        extracted_pages.append({"content": content, "metadata": metadata})
+
+    return extracted_pages
+
+
+def extract_docx_pages(file_path: str) -> list[dict]:
+    document = DocxDocument(file_path)
+    paragraphs = [paragraph.text.strip() for paragraph in document.paragraphs if paragraph.text.strip()]
+    content = "\n\n".join(paragraphs)
+    return [{"content": content, "metadata": {"page": 0, "source": "docx"}}] if content else []
+
+
+def extract_document_pages(file_path: str, doc_name: str) -> list[dict]:
+    lower_name = doc_name.lower()
+    if lower_name.endswith(".pdf"):
+        return extract_pdf_pages(file_path)
+    if lower_name.endswith(".docx"):
+        return extract_docx_pages(file_path)
+    return []
+
+
+def split_document_pages(pages: list[dict]) -> list[dict]:
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=1200,
+        chunk_overlap=160,
+        separators=["\n\n", "\n", ". ", " ", ""],
+    )
+    chunks = []
+
+    for page in pages:
+        page_chunks = splitter.split_text(page["content"])
+        for index, content in enumerate(page_chunks):
+            clean_content = content.strip()
+            if not clean_content:
+                continue
+            metadata = dict(page["metadata"])
+            metadata["chunk_index"] = index
+            chunks.append({"content": clean_content, "metadata": metadata})
+
+    return chunks
+
+
+def build_document_preview_text(chunks: list[dict], max_chars: int = 60000) -> str:
+    preview_parts = []
+    current_length = 0
+
+    for chunk in chunks:
+        content = chunk["content"]
+        if current_length + len(content) > max_chars:
+            break
+        preview_parts.append(content)
+        current_length += len(content)
+
+    return "\n\n".join(preview_parts)
+
+
+def insert_chunk_batch(document_id: str, chunks: list[dict], start: int, batch_size: int) -> int:
+    batch = chunks[start:start + batch_size]
+    texts = [chunk["content"] for chunk in batch]
+    vectors = embeddings_model.embed_documents(texts)
+    rows = [
+        {
+            "document_id": document_id,
+            "content": chunk["content"],
+            "embedding": vector,
+            "metadata": chunk["metadata"],
+        }
+        for chunk, vector in zip(batch, vectors)
+    ]
+    supabase.table("document_chunks").insert(rows).execute()
+    return len(rows)
+
+
+def index_document_sync(document_id: str) -> None:
+    temp_path = None
+
+    try:
+        res = supabase.table("documents").select("*").eq("id", document_id).single().execute()
+        doc_data = res.data
+        if not doc_data:
+            raise ValueError(f"Documento {document_id} no encontrado.")
+
+        doc_name = doc_data.get("name", "")
+        lower_name = doc_name.lower()
+
+        if lower_name.endswith((".jpg", ".jpeg", ".png")):
+            update_index_status(
+                document_id,
+                index_status="skipped",
+                index_progress=100,
+                index_message="Imagen lista para consultas directas con @ en el chat.",
+                index_error=None,
+            )
+            return
+
+        update_index_status(
+            document_id,
+            index_status="processing",
+            index_progress=5,
+            index_message="Descargando archivo para indexacion.",
+            index_error=None,
+        )
+
+        temp_path = download_document_to_temp(doc_data)
+
+        update_index_status(
+            document_id,
+            index_progress=20,
+            index_message="Extrayendo texto del documento.",
+        )
+        pages = extract_document_pages(temp_path, doc_name)
+        page_count = doc_data.get("page_count") or (len(pages) if pages else None)
+
+        if not pages:
+            update_index_status(
+                document_id,
+                index_status="error",
+                index_progress=0,
+                index_message="No se pudo extraer texto indexable del documento.",
+                index_error="Documento sin texto extraible. Si es escaneado, requiere OCR especializado.",
+                page_count=page_count,
+            )
+            return
+
+        update_index_status(
+            document_id,
+            index_progress=35,
+            index_message="Dividiendo contenido en fragmentos.",
+            page_count=page_count,
+        )
+        chunks = split_document_pages(pages)
+
+        if not chunks:
+            update_index_status(
+                document_id,
+                index_status="error",
+                index_progress=0,
+                index_message="No se generaron fragmentos indexables.",
+                index_error="El documento no produjo chunks validos.",
+                page_count=page_count,
+            )
+            return
+
+        supabase.table("document_chunks").delete().eq("document_id", document_id).execute()
+
+        inserted = 0
+        total_chunks = len(chunks)
+        for start in range(0, total_chunks, INDEX_BATCH_SIZE):
+            inserted += insert_chunk_batch(document_id, chunks, start, INDEX_BATCH_SIZE)
+            progress = 40 + int((inserted / total_chunks) * 55)
+            update_index_status(
+                document_id,
+                index_progress=min(progress, 95),
+                index_message=f"Generando embeddings: {inserted} de {total_chunks} fragmentos.",
+                chunk_count=inserted,
+            )
+
+        preview_text = build_document_preview_text(chunks)
+        update_index_status(
+            document_id,
+            content=preview_text or doc_data.get("content"),
+            status="ready",
+            index_status="indexed",
+            index_progress=100,
+            index_message="Documento indexado y disponible para busqueda semantica.",
+            chunk_count=total_chunks,
+            indexed_at=datetime.now(timezone.utc).isoformat(),
+            index_error=None,
+            page_count=page_count,
+        )
+    except Exception as exc:
+        update_index_status(
+            document_id,
+            status="error",
+            index_status="error",
+            index_progress=0,
+            index_message="Error durante la indexacion.",
+            index_error=str(exc),
+        )
+    finally:
+        if temp_path and os.path.exists(temp_path):
+            os.remove(temp_path)
+
+
+def index_pending_sync(limit: int = INDEX_MAX_PENDING) -> int:
+    res = (
+        supabase.table("documents")
+        .select("id")
+        .eq("index_status", "uploaded")
+        .order("uploaded_at", desc=False)
+        .limit(limit)
+        .execute()
+    )
+    docs = res.data or []
+
+    for doc in docs:
+        index_document_sync(doc["id"])
+
+    return len(docs)
 
 
 def get_or_upload_to_google(document_id: str):
@@ -314,6 +573,29 @@ def general_chat_fallback(message: str) -> str:
     if normalized == "quien eres":
         return "Soy SIGED-IA, un asistente juridico para consultar documentos y responder preguntas basadas en tu base documental."
     return "Puedo ayudarte con consultas juridicas generales y con la busqueda de informacion dentro de los documentos que has subido."
+
+
+@app.post("/jobs/index-document/{document_id}", response_model=JobResponse, status_code=202)
+async def queue_index_document(
+    document_id: str,
+    background_tasks: BackgroundTasks,
+    x_worker_secret: Optional[str] = Header(default=None),
+):
+    verify_worker_secret(x_worker_secret)
+    background_tasks.add_task(index_document_sync, document_id)
+    return JobResponse(queued=True, document_id=document_id, count=1)
+
+
+@app.post("/jobs/index-pending", response_model=JobResponse, status_code=202)
+async def queue_index_pending(
+    background_tasks: BackgroundTasks,
+    limit: int = INDEX_MAX_PENDING,
+    x_worker_secret: Optional[str] = Header(default=None),
+):
+    verify_worker_secret(x_worker_secret)
+    safe_limit = max(1, min(limit, 10))
+    background_tasks.add_task(index_pending_sync, safe_limit)
+    return JobResponse(queued=True, count=safe_limit)
 
 
 @app.post("/ask")

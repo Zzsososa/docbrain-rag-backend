@@ -46,6 +46,8 @@ EMBEDDING_MODELS = os.getenv(
 EMBEDDING_DIMENSIONS = int(os.getenv("GOOGLE_EMBEDDING_DIMENSIONS", "768"))
 INDEX_BATCH_SIZE = int(os.getenv("INDEX_BATCH_SIZE", "24"))
 INDEX_MAX_PENDING = int(os.getenv("INDEX_MAX_PENDING", "3"))
+EMBEDDING_RATE_LIMIT_PAUSE_SECONDS = int(os.getenv("EMBEDDING_RATE_LIMIT_PAUSE_SECONDS", "35"))
+EMBEDDING_MAX_RETRIES = int(os.getenv("EMBEDDING_MAX_RETRIES", "4"))
 
 SPANISH_STOPWORDS = {
     "a", "al", "algo", "alguna", "alguno", "ante", "bajo", "como", "con", "contra", "cual",
@@ -153,6 +155,18 @@ def extract_terms(text: str) -> list[str]:
 def is_quota_error(message: str) -> bool:
     lowered = message.lower()
     return "quota exceeded" in lowered or "429" in lowered or "rate limit" in lowered
+
+
+def extract_retry_delay_seconds(message: str) -> Optional[int]:
+    retry_match = re.search(r"retryDelay': '(\d+)s'", message)
+    if retry_match:
+        return int(retry_match.group(1))
+
+    retry_match = re.search(r"retry in ([0-9.]+)s", message, re.IGNORECASE)
+    if retry_match:
+        return int(float(retry_match.group(1))) + 1
+
+    return None
 
 
 def looks_like_general_chat(message: str) -> bool:
@@ -346,7 +360,22 @@ def build_document_preview_text(chunks: list[dict], max_chars: int = 60000) -> s
 def insert_chunk_batch(document_id: str, chunks: list[dict], start: int, batch_size: int) -> int:
     batch = chunks[start:start + batch_size]
     texts = [chunk["content"] for chunk in batch]
-    vectors = embed_documents_with_fallback(texts)
+
+    for attempt in range(EMBEDDING_MAX_RETRIES + 1):
+        try:
+            vectors = embed_documents_with_fallback(texts)
+            break
+        except Exception as exc:
+            if not is_quota_error(str(exc)) or attempt >= EMBEDDING_MAX_RETRIES:
+                raise
+
+            wait_seconds = extract_retry_delay_seconds(str(exc)) or EMBEDDING_RATE_LIMIT_PAUSE_SECONDS
+            update_index_status(
+                document_id,
+                index_message=f"Esperando cuota de embeddings. Reintento en {wait_seconds} segundos.",
+            )
+            time.sleep(wait_seconds)
+
     rows = [
         {
             "document_id": document_id,

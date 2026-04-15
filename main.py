@@ -487,11 +487,18 @@ def index_document_sync(document_id: str) -> None:
             page_count=page_count,
         )
     except Exception as exc:
+        current_progress = 0
+        try:
+            current_doc = supabase.table("documents").select("index_progress").eq("id", document_id).single().execute()
+            current_progress = int((current_doc.data or {}).get("index_progress") or 0)
+        except Exception:
+            current_progress = 0
+
         update_index_status(
             document_id,
             status="error",
             index_status="error",
-            index_progress=0,
+            index_progress=current_progress,
             index_message="Error durante la indexacion.",
             index_error=str(exc),
         )

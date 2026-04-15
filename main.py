@@ -41,8 +41,9 @@ GOOGLE_FILE_PROCESS_TIMEOUT = int(os.getenv("GOOGLE_FILE_PROCESS_TIMEOUT", "90")
 WORKER_SECRET = os.getenv("WORKER_SECRET")
 EMBEDDING_MODELS = os.getenv(
     "GOOGLE_EMBEDDING_MODELS",
-    os.getenv("GOOGLE_EMBEDDING_MODEL", "models/text-embedding-004"),
+    os.getenv("GOOGLE_EMBEDDING_MODEL", "models/gemini-embedding-001"),
 )
+EMBEDDING_DIMENSIONS = int(os.getenv("GOOGLE_EMBEDDING_DIMENSIONS", "768"))
 INDEX_BATCH_SIZE = int(os.getenv("INDEX_BATCH_SIZE", "24"))
 INDEX_MAX_PENDING = int(os.getenv("INDEX_MAX_PENDING", "3"))
 
@@ -116,7 +117,7 @@ def parse_model_candidates(raw_models: str, fallback: str) -> list[str]:
 
 DOC_MODEL_CANDIDATES = parse_model_candidates(DOC_MODELS, DOC_MODEL)
 GENERAL_MODEL_CANDIDATES = parse_model_candidates(GENERAL_MODELS, GENERAL_MODEL)
-EMBEDDING_MODEL_CANDIDATES = parse_model_candidates(EMBEDDING_MODELS, "models/text-embedding-004")
+EMBEDDING_MODEL_CANDIDATES = parse_model_candidates(EMBEDDING_MODELS, "models/gemini-embedding-001")
 
 
 def normalize_text(text: str) -> str:
@@ -203,6 +204,7 @@ def get_embeddings_model(model_name: str) -> GoogleGenerativeAIEmbeddings:
         embeddings_model_cache[model_name] = GoogleGenerativeAIEmbeddings(
             model=model_name,
             google_api_key=GOOGLE_API_KEY,
+            output_dimensionality=EMBEDDING_DIMENSIONS,
         )
     return embeddings_model_cache[model_name]
 

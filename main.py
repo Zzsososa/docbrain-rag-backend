@@ -39,7 +39,10 @@ GOOGLE_MAX_RETRIES = int(os.getenv("GOOGLE_MAX_RETRIES", "2"))
 GOOGLE_POLL_SECONDS = int(os.getenv("GOOGLE_POLL_SECONDS", "2"))
 GOOGLE_FILE_PROCESS_TIMEOUT = int(os.getenv("GOOGLE_FILE_PROCESS_TIMEOUT", "90"))
 WORKER_SECRET = os.getenv("WORKER_SECRET")
-EMBEDDING_MODEL = os.getenv("GOOGLE_EMBEDDING_MODEL", "models/embedding-001")
+EMBEDDING_MODELS = os.getenv(
+    "GOOGLE_EMBEDDING_MODELS",
+    os.getenv("GOOGLE_EMBEDDING_MODEL", "models/text-embedding-004"),
+)
 INDEX_BATCH_SIZE = int(os.getenv("INDEX_BATCH_SIZE", "24"))
 INDEX_MAX_PENDING = int(os.getenv("INDEX_MAX_PENDING", "3"))
 
@@ -88,10 +91,7 @@ if missing_env:
 
 genai.configure(api_key=GOOGLE_API_KEY)
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
-embeddings_model = GoogleGenerativeAIEmbeddings(
-    model=EMBEDDING_MODEL,
-    google_api_key=GOOGLE_API_KEY,
-)
+embeddings_model_cache: dict[str, GoogleGenerativeAIEmbeddings] = {}
 
 app = FastAPI()
 
@@ -116,6 +116,7 @@ def parse_model_candidates(raw_models: str, fallback: str) -> list[str]:
 
 DOC_MODEL_CANDIDATES = parse_model_candidates(DOC_MODELS, DOC_MODEL)
 GENERAL_MODEL_CANDIDATES = parse_model_candidates(GENERAL_MODELS, GENERAL_MODEL)
+EMBEDDING_MODEL_CANDIDATES = parse_model_candidates(EMBEDDING_MODELS, "models/text-embedding-004")
 
 
 def normalize_text(text: str) -> str:
@@ -191,6 +192,30 @@ def generate_with_fallback(model_names: list[str], payload):
         except Exception as exc:
             last_error = exc
             if is_quota_error(str(exc)):
+                continue
+            raise
+
+    raise last_error
+
+
+def get_embeddings_model(model_name: str) -> GoogleGenerativeAIEmbeddings:
+    if model_name not in embeddings_model_cache:
+        embeddings_model_cache[model_name] = GoogleGenerativeAIEmbeddings(
+            model=model_name,
+            google_api_key=GOOGLE_API_KEY,
+        )
+    return embeddings_model_cache[model_name]
+
+
+def embed_documents_with_fallback(texts: list[str]) -> list[list[float]]:
+    last_error = None
+
+    for model_name in EMBEDDING_MODEL_CANDIDATES:
+        try:
+            return get_embeddings_model(model_name).embed_documents(texts)
+        except Exception as exc:
+            last_error = exc
+            if "not_found" in str(exc).lower() or "404" in str(exc):
                 continue
             raise
 
@@ -294,7 +319,7 @@ def build_document_preview_text(chunks: list[dict], max_chars: int = 60000) -> s
 def insert_chunk_batch(document_id: str, chunks: list[dict], start: int, batch_size: int) -> int:
     batch = chunks[start:start + batch_size]
     texts = [chunk["content"] for chunk in batch]
-    vectors = embeddings_model.embed_documents(texts)
+    vectors = embed_documents_with_fallback(texts)
     rows = [
         {
             "document_id": document_id,

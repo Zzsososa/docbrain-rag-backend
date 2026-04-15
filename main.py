@@ -115,6 +115,10 @@ class JobResponse(BaseModel):
     count: int = 0
 
 
+class DailyEmbeddingQuotaError(Exception):
+    pass
+
+
 def parse_model_candidates(raw_models: str, fallback: str) -> list[str]:
     candidates = [item.strip() for item in raw_models.split(",") if item.strip()]
     if fallback and fallback not in candidates:
@@ -155,6 +159,16 @@ def extract_terms(text: str) -> list[str]:
 def is_quota_error(message: str) -> bool:
     lowered = message.lower()
     return "quota exceeded" in lowered or "429" in lowered or "rate limit" in lowered
+
+
+def is_daily_embedding_quota_error(message: str) -> bool:
+    lowered = message.lower()
+    return (
+        "embedcontentrequestsperday" in lowered
+        or "requestsperday" in lowered
+        or "per day" in lowered
+        or "current quota" in lowered and "quotaValue': '1000'" in message
+    )
 
 
 def extract_retry_delay_seconds(message: str) -> Optional[int]:
@@ -366,6 +380,9 @@ def insert_chunk_batch(document_id: str, chunks: list[dict], start: int, batch_s
             vectors = embed_documents_with_fallback(texts)
             break
         except Exception as exc:
+            if is_daily_embedding_quota_error(str(exc)):
+                raise DailyEmbeddingQuotaError(str(exc)) from exc
+
             if not is_quota_error(str(exc)) or attempt >= EMBEDDING_MAX_RETRIES:
                 raise
 
@@ -459,11 +476,42 @@ def index_document_sync(document_id: str) -> None:
             )
             return
 
-        supabase.table("document_chunks").delete().eq("document_id", document_id).execute()
+        existing_chunks_res = (
+            supabase.table("document_chunks")
+            .select("id", count="exact")
+            .eq("document_id", document_id)
+            .execute()
+        )
+        existing_chunk_count = existing_chunks_res.count or 0
 
-        inserted = 0
         total_chunks = len(chunks)
-        for start in range(0, total_chunks, INDEX_BATCH_SIZE):
+        inserted = min(existing_chunk_count, total_chunks)
+
+        if inserted >= total_chunks:
+            preview_text = build_document_preview_text(chunks)
+            update_index_status(
+                document_id,
+                content=preview_text or doc_data.get("content"),
+                status="ready",
+                index_status="indexed",
+                index_progress=100,
+                index_message="Documento indexado y disponible para busqueda semantica.",
+                chunk_count=total_chunks,
+                indexed_at=datetime.now(timezone.utc).isoformat(),
+                index_error=None,
+                page_count=page_count,
+            )
+            return
+
+        if inserted > 0:
+            update_index_status(
+                document_id,
+                index_progress=40 + int((inserted / total_chunks) * 55),
+                index_message=f"Reanudando embeddings desde {inserted} de {total_chunks} fragmentos.",
+                chunk_count=inserted,
+            )
+
+        for start in range(inserted, total_chunks, INDEX_BATCH_SIZE):
             inserted += insert_chunk_batch(document_id, chunks, start, INDEX_BATCH_SIZE)
             progress = 40 + int((inserted / total_chunks) * 55)
             update_index_status(
@@ -485,6 +533,31 @@ def index_document_sync(document_id: str) -> None:
             indexed_at=datetime.now(timezone.utc).isoformat(),
             index_error=None,
             page_count=page_count,
+        )
+    except DailyEmbeddingQuotaError as exc:
+        current_progress = 0
+        current_chunk_count = 0
+        try:
+            current_doc = (
+                supabase.table("documents")
+                .select("index_progress,chunk_count")
+                .eq("id", document_id)
+                .single()
+                .execute()
+            )
+            current_progress = int((current_doc.data or {}).get("index_progress") or 0)
+            current_chunk_count = int((current_doc.data or {}).get("chunk_count") or 0)
+        except Exception:
+            current_progress = 0
+
+        update_index_status(
+            document_id,
+            status="ready",
+            index_status="paused",
+            index_progress=current_progress,
+            index_message="Indexacion pausada por limite diario de embeddings. Se reanudara cuando la cuota se restablezca.",
+            index_error=str(exc),
+            chunk_count=current_chunk_count,
         )
     except Exception as exc:
         current_progress = 0
@@ -511,7 +584,7 @@ def index_pending_sync(limit: int = INDEX_MAX_PENDING) -> int:
     res = (
         supabase.table("documents")
         .select("id")
-        .eq("index_status", "uploaded")
+        .in_("index_status", ["uploaded", "paused"])
         .order("uploaded_at", desc=False)
         .limit(limit)
         .execute()

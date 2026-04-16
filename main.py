@@ -290,12 +290,22 @@ def get_embeddings_model(model_name: str, api_key: Optional[str] = None) -> Goog
     return embeddings_model_cache[cache_key]
 
 
-def embed_documents_with_fallback(texts: list[str]) -> list[list[float]]:
+def embed_documents_with_fallback(
+    texts: list[str],
+    *,
+    task_type: str = "RETRIEVAL_DOCUMENT",
+    titles: Optional[list[str]] = None,
+    api_key: Optional[str] = None,
+) -> list[list[float]]:
     last_error = None
 
     for model_name in EMBEDDING_MODEL_CANDIDATES:
         try:
-            return get_embeddings_model(model_name).embed_documents(texts)
+            return get_embeddings_model(model_name, api_key=api_key).embed_documents(
+                texts,
+                task_type=task_type,
+                titles=titles,
+            )
         except Exception as exc:
             last_error = exc
             if "not_found" in str(exc).lower() or "404" in str(exc):
@@ -305,12 +315,22 @@ def embed_documents_with_fallback(texts: list[str]) -> list[list[float]]:
     raise last_error
 
 
-def embed_query_with_fallback(text: str, api_key: Optional[str] = None) -> list[float]:
+def embed_query_with_fallback(
+    text: str,
+    api_key: Optional[str] = None,
+    *,
+    task_type: str = "RETRIEVAL_QUERY",
+    title: Optional[str] = None,
+) -> list[float]:
     last_error = None
 
     for model_name in EMBEDDING_MODEL_CANDIDATES:
         try:
-            return get_embeddings_model(model_name, api_key=api_key).embed_query(text)
+            return get_embeddings_model(model_name, api_key=api_key).embed_query(
+                text,
+                task_type=task_type,
+                title=title,
+            )
         except Exception as exc:
             last_error = exc
             if "not_found" in str(exc).lower() or "404" in str(exc):
@@ -613,6 +633,19 @@ def split_document_pages(pages: list[dict], page_count: Optional[int] = None) ->
     return chunks
 
 
+def build_embedding_ready_text(chunk: dict, doc_name: str) -> str:
+    metadata = chunk.get("metadata") or {}
+    page_value = metadata.get("page")
+    page_label = ""
+    if isinstance(page_value, int):
+        page_label = f" | Pagina {page_value + 1}"
+    elif page_value is not None:
+        page_label = f" | Pagina {page_value}"
+
+    content = (chunk.get("content") or "").strip()
+    return f"Titulo del documento: {doc_name}{page_label}\n\n{content}"
+
+
 def build_document_preview_text(chunks: list[dict], max_chars: int = 60000) -> str:
     preview_parts = []
     current_length = 0
@@ -627,13 +660,18 @@ def build_document_preview_text(chunks: list[dict], max_chars: int = 60000) -> s
     return "\n\n".join(preview_parts)
 
 
-def insert_chunk_batch(document_id: str, chunks: list[dict], start: int, batch_size: int) -> int:
+def insert_chunk_batch(document_id: str, doc_name: str, chunks: list[dict], start: int, batch_size: int) -> int:
     batch = chunks[start:start + batch_size]
-    texts = [chunk["content"] for chunk in batch]
+    texts = [build_embedding_ready_text(chunk, doc_name) for chunk in batch]
+    titles = [doc_name for _ in batch]
 
     for attempt in range(EMBEDDING_MAX_RETRIES + 1):
         try:
-            vectors = embed_documents_with_fallback(texts)
+            vectors = embed_documents_with_fallback(
+                texts,
+                task_type="RETRIEVAL_DOCUMENT",
+                titles=titles,
+            )
             break
         except Exception as exc:
             if is_daily_embedding_quota_error(str(exc)):
@@ -772,7 +810,7 @@ def index_document_sync(document_id: str) -> None:
             )
 
         for start in range(inserted, total_chunks, INDEX_BATCH_SIZE):
-            inserted += insert_chunk_batch(document_id, chunks, start, INDEX_BATCH_SIZE)
+            inserted += insert_chunk_batch(document_id, doc_name, chunks, start, INDEX_BATCH_SIZE)
             progress = 40 + int((inserted / total_chunks) * 55)
             update_index_status(
                 document_id,
@@ -997,7 +1035,11 @@ def enrich_chunk_matches(matches: list[dict]) -> list[dict]:
 
 
 def search_documents_semantic(query: str, match_count: int = 8, api_key: Optional[str] = None) -> list[dict]:
-    query_embedding = embed_query_with_fallback(query, api_key=api_key)
+    query_embedding = embed_query_with_fallback(
+        query,
+        api_key=api_key,
+        task_type="RETRIEVAL_QUERY",
+    )
     response = supabase.rpc(
         "match_document_chunks_hybrid",
         {

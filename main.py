@@ -5,6 +5,7 @@ import unicodedata
 from pathlib import Path
 import tempfile
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 import requests
 from fastapi import BackgroundTasks, FastAPI, Header, HTTPException
 from pydantic import BaseModel
@@ -53,6 +54,8 @@ CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "180"))
 LARGE_DOC_PAGE_THRESHOLD = int(os.getenv("LARGE_DOC_PAGE_THRESHOLD", "60"))
 LARGE_DOC_CHUNK_SIZE = int(os.getenv("LARGE_DOC_CHUNK_SIZE", "2600"))
 LARGE_DOC_CHUNK_OVERLAP = int(os.getenv("LARGE_DOC_CHUNK_OVERLAP", "220"))
+USAGE_TIMEZONE = os.getenv("USAGE_TIMEZONE", "America/Santo_Domingo")
+MAX_DAILY_GOOGLE_CHAT_REQUESTS = int(os.getenv("MAX_DAILY_GOOGLE_CHAT_REQUESTS", "50"))
 
 SPANISH_STOPWORDS = {
     "a", "al", "algo", "alguna", "alguno", "ante", "bajo", "como", "con", "contra", "cual",
@@ -285,6 +288,52 @@ def embed_query_with_fallback(text: str) -> list[float]:
 def verify_worker_secret(x_worker_secret: Optional[str]) -> None:
     if WORKER_SECRET and x_worker_secret != WORKER_SECRET:
         raise HTTPException(status_code=401, detail="Worker no autorizado.")
+
+
+def get_usage_day() -> str:
+    try:
+        return datetime.now(ZoneInfo(USAGE_TIMEZONE)).date().isoformat()
+    except Exception:
+        return datetime.now(timezone.utc).date().isoformat()
+
+
+def count_usage_events(event_type: str, usage_day: Optional[str] = None) -> int:
+    target_day = usage_day or get_usage_day()
+    response = (
+        supabase.table("ai_usage_events")
+        .select("id", count="exact")
+        .eq("event_type", event_type)
+        .eq("usage_day", target_day)
+        .execute()
+    )
+    return response.count or 0
+
+
+def reserve_daily_google_request_budget(request: ChatRequest) -> str:
+    response = supabase.rpc(
+        "reserve_daily_ai_usage_slot",
+        {
+            "p_event_type": "chat_google_request",
+            "p_daily_limit": MAX_DAILY_GOOGLE_CHAT_REQUESTS,
+            "p_resource_id": request.document_id,
+            "p_metadata": {
+                "message_length": len(request.message or ""),
+                "document_mode": bool(request.document_id),
+            },
+        },
+    ).execute()
+    slot = (response.data or [{}])[0]
+    usage_day = slot.get("usage_day") or get_usage_day()
+
+    if not slot.get("allowed", False):
+        raise HTTPException(
+            status_code=429,
+            detail=(
+                f"Se alcanzo el limite diario de {MAX_DAILY_GOOGLE_CHAT_REQUESTS} consultas con IA para {usage_day}. "
+                "Intenta de nuevo manana."
+            ),
+        )
+    return usage_day
 
 
 def update_index_status(document_id: str, **updates) -> None:
@@ -600,7 +649,7 @@ def index_pending_sync(limit: int = INDEX_MAX_PENDING) -> int:
     res = (
         supabase.table("documents")
         .select("id")
-        .in_("index_status", ["uploaded", "paused"])
+        .eq("index_status", "uploaded")
         .order("uploaded_at", desc=False)
         .limit(limit)
         .execute()
@@ -858,6 +907,7 @@ async def ask_document(request: ChatRequest):
     try:
         if request.document_id:
             try:
+                reserve_daily_google_request_budget(request)
                 google_file = get_or_upload_to_google(request.document_id)
                 response, model_name = generate_with_fallback(
                     DOC_MODEL_CANDIDATES,
@@ -882,6 +932,7 @@ async def ask_document(request: ChatRequest):
 
         if looks_like_general_chat(request.message):
             try:
+                reserve_daily_google_request_budget(request)
                 response, model_name = generate_with_fallback(
                     GENERAL_MODEL_CANDIDATES,
                     f"Eres SIGED-IA, un asistente juridico experto. Responde de forma breve y natural a esto: {request.message}",
@@ -894,6 +945,7 @@ async def ask_document(request: ChatRequest):
 
         if should_search_knowledge_base(request.message):
             try:
+                reserve_daily_google_request_budget(request)
                 semantic_matches = search_documents_semantic(request.message)
                 if semantic_matches:
                     evidence_blocks = build_semantic_evidence_blocks(semantic_matches)
@@ -974,6 +1026,7 @@ async def ask_document(request: ChatRequest):
 
         if looks_like_general_knowledge(request.message):
             try:
+                reserve_daily_google_request_budget(request)
                 response, model_name = generate_with_fallback(
                     GENERAL_MODEL_CANDIDATES,
                     f"Eres SIGED-IA, un asistente juridico experto. Responde de forma clara y breve a esto: {request.message}",
@@ -985,6 +1038,7 @@ async def ask_document(request: ChatRequest):
                 raise
 
         try:
+            reserve_daily_google_request_budget(request)
             response, model_name = generate_with_fallback(
                 GENERAL_MODEL_CANDIDATES,
                 f"Eres SIGED-IA, un asistente juridico experto. Responde de forma breve y util a esto: {request.message}",

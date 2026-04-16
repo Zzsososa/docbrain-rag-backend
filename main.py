@@ -2,10 +2,12 @@ import os
 import re
 import time
 import unicodedata
+import mimetypes
 from pathlib import Path
 import tempfile
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
+from dataclasses import dataclass
 import requests
 from fastapi import BackgroundTasks, FastAPI, Header, HTTPException
 from pydantic import BaseModel
@@ -32,10 +34,15 @@ for env_path in ENV_CANDIDATES:
 SUPABASE_URL = os.getenv("NEXT_PUBLIC_SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 GOOGLE_API_KEY = os.getenv("GOOGLE_AI_KEY")
-DOC_MODEL = os.getenv("GOOGLE_DOC_MODEL", "gemini-2.5-flash")
-GENERAL_MODEL = os.getenv("GOOGLE_GENERAL_MODEL", "gemini-2.5-flash")
+GOOGLE_BONUS_API_KEY = os.getenv("GOOGLE_AI_KEY_BONUS_FREE")
+DOC_MODEL = os.getenv("GOOGLE_DOC_MODEL", "gemini-1.5-flash")
+GENERAL_MODEL = os.getenv("GOOGLE_GENERAL_MODEL", "gemini-1.5-flash")
 DOC_MODELS = os.getenv("GOOGLE_DOC_MODELS", DOC_MODEL)
 GENERAL_MODELS = os.getenv("GOOGLE_GENERAL_MODELS", GENERAL_MODEL)
+BONUS_DOC_MODEL = os.getenv("GOOGLE_BONUS_DOC_MODEL", "gemini-1.5-flash")
+BONUS_GENERAL_MODEL = os.getenv("GOOGLE_BONUS_GENERAL_MODEL", "gemini-1.5-flash")
+BONUS_DOC_MODELS = os.getenv("GOOGLE_BONUS_DOC_MODELS", BONUS_DOC_MODEL)
+BONUS_GENERAL_MODELS = os.getenv("GOOGLE_BONUS_GENERAL_MODELS", BONUS_GENERAL_MODEL)
 GOOGLE_MAX_RETRIES = int(os.getenv("GOOGLE_MAX_RETRIES", "2"))
 GOOGLE_POLL_SECONDS = int(os.getenv("GOOGLE_POLL_SECONDS", "2"))
 GOOGLE_FILE_PROCESS_TIMEOUT = int(os.getenv("GOOGLE_FILE_PROCESS_TIMEOUT", "90"))
@@ -55,7 +62,8 @@ LARGE_DOC_PAGE_THRESHOLD = int(os.getenv("LARGE_DOC_PAGE_THRESHOLD", "60"))
 LARGE_DOC_CHUNK_SIZE = int(os.getenv("LARGE_DOC_CHUNK_SIZE", "2600"))
 LARGE_DOC_CHUNK_OVERLAP = int(os.getenv("LARGE_DOC_CHUNK_OVERLAP", "220"))
 USAGE_TIMEZONE = os.getenv("USAGE_TIMEZONE", "America/Santo_Domingo")
-MAX_DAILY_GOOGLE_CHAT_REQUESTS = int(os.getenv("MAX_DAILY_GOOGLE_CHAT_REQUESTS", "50"))
+MAX_DAILY_PAID_CHAT_REQUESTS = int(os.getenv("MAX_DAILY_PAID_CHAT_REQUESTS", os.getenv("MAX_DAILY_GOOGLE_CHAT_REQUESTS", "50")))
+MAX_DAILY_BONUS_CHAT_REQUESTS = int(os.getenv("MAX_DAILY_BONUS_CHAT_REQUESTS", "30"))
 
 SPANISH_STOPWORDS = {
     "a", "al", "algo", "alguna", "alguno", "ante", "bajo", "como", "con", "contra", "cual",
@@ -127,6 +135,15 @@ class DailyEmbeddingQuotaError(Exception):
     pass
 
 
+@dataclass
+class ChatUsageReservation:
+    allowed: bool
+    tier: str
+    usage_day: str
+    used_count: int
+    limit_count: int
+
+
 def parse_model_candidates(raw_models: str, fallback: str) -> list[str]:
     candidates = [item.strip() for item in raw_models.split(",") if item.strip()]
     if fallback and fallback not in candidates:
@@ -136,6 +153,8 @@ def parse_model_candidates(raw_models: str, fallback: str) -> list[str]:
 
 DOC_MODEL_CANDIDATES = parse_model_candidates(DOC_MODELS, DOC_MODEL)
 GENERAL_MODEL_CANDIDATES = parse_model_candidates(GENERAL_MODELS, GENERAL_MODEL)
+BONUS_DOC_MODEL_CANDIDATES = parse_model_candidates(BONUS_DOC_MODELS, BONUS_DOC_MODEL)
+BONUS_GENERAL_MODEL_CANDIDATES = parse_model_candidates(BONUS_GENERAL_MODELS, BONUS_GENERAL_MODEL)
 EMBEDDING_MODEL_CANDIDATES = parse_model_candidates(EMBEDDING_MODELS, "models/gemini-embedding-001")
 
 
@@ -245,14 +264,30 @@ def generate_with_fallback(model_names: list[str], payload):
     raise last_error
 
 
-def get_embeddings_model(model_name: str) -> GoogleGenerativeAIEmbeddings:
-    if model_name not in embeddings_model_cache:
-        embeddings_model_cache[model_name] = GoogleGenerativeAIEmbeddings(
+def extract_response_text(response) -> str:
+    return getattr(response, "text", "") or ""
+
+
+def build_bonus_notice(slot: ChatUsageReservation) -> Optional[str]:
+    if slot.tier == "bonus" and slot.used_count == 1:
+        return "Oye, como regalo por haber pagado esta app, tienes 30 solicitudes mas."
+    return None
+
+
+def prepend_bonus_notice(answer: str, slot: ChatUsageReservation) -> str:
+    notice = build_bonus_notice(slot)
+    return f"{notice}\n\n{answer}" if notice else answer
+
+
+def get_embeddings_model(model_name: str, api_key: Optional[str] = None) -> GoogleGenerativeAIEmbeddings:
+    cache_key = f"{api_key or GOOGLE_API_KEY}:{model_name}"
+    if cache_key not in embeddings_model_cache:
+        embeddings_model_cache[cache_key] = GoogleGenerativeAIEmbeddings(
             model=model_name,
-            google_api_key=GOOGLE_API_KEY,
+            google_api_key=api_key or GOOGLE_API_KEY,
             output_dimensionality=EMBEDDING_DIMENSIONS,
         )
-    return embeddings_model_cache[model_name]
+    return embeddings_model_cache[cache_key]
 
 
 def embed_documents_with_fallback(texts: list[str]) -> list[list[float]]:
@@ -270,12 +305,12 @@ def embed_documents_with_fallback(texts: list[str]) -> list[list[float]]:
     raise last_error
 
 
-def embed_query_with_fallback(text: str) -> list[float]:
+def embed_query_with_fallback(text: str, api_key: Optional[str] = None) -> list[float]:
     last_error = None
 
     for model_name in EMBEDDING_MODEL_CANDIDATES:
         try:
-            return get_embeddings_model(model_name).embed_query(text)
+            return get_embeddings_model(model_name, api_key=api_key).embed_query(text)
         except Exception as exc:
             last_error = exc
             if "not_found" in str(exc).lower() or "404" in str(exc):
@@ -309,12 +344,12 @@ def count_usage_events(event_type: str, usage_day: Optional[str] = None) -> int:
     return response.count or 0
 
 
-def reserve_daily_google_request_budget(request: ChatRequest) -> str:
+def reserve_slot(event_type: str, daily_limit: int, request: ChatRequest) -> ChatUsageReservation:
     response = supabase.rpc(
         "reserve_daily_ai_usage_slot",
         {
-            "p_event_type": "chat_google_request",
-            "p_daily_limit": MAX_DAILY_GOOGLE_CHAT_REQUESTS,
+            "p_event_type": event_type,
+            "p_daily_limit": daily_limit,
             "p_resource_id": request.document_id,
             "p_metadata": {
                 "message_length": len(request.message or ""),
@@ -323,17 +358,177 @@ def reserve_daily_google_request_budget(request: ChatRequest) -> str:
         },
     ).execute()
     slot = (response.data or [{}])[0]
-    usage_day = slot.get("usage_day") or get_usage_day()
+    return ChatUsageReservation(
+        allowed=bool(slot.get("allowed", False)),
+        tier="paid" if event_type == "chat_paid_request" else "bonus",
+        usage_day=slot.get("usage_day") or get_usage_day(),
+        used_count=int(slot.get("used_count") or 0),
+        limit_count=int(slot.get("limit_count") or daily_limit),
+    )
 
-    if not slot.get("allowed", False):
-        raise HTTPException(
-            status_code=429,
-            detail=(
-                f"Se alcanzo el limite diario de {MAX_DAILY_GOOGLE_CHAT_REQUESTS} consultas con IA para {usage_day}. "
-                "Intenta de nuevo manana."
-            ),
+
+def reserve_daily_google_request_budget(request: ChatRequest) -> ChatUsageReservation:
+    paid_slot = reserve_slot("chat_paid_request", MAX_DAILY_PAID_CHAT_REQUESTS, request)
+    if paid_slot.allowed:
+        return paid_slot
+
+    if GOOGLE_BONUS_API_KEY:
+        bonus_slot = reserve_slot("chat_bonus_request", MAX_DAILY_BONUS_CHAT_REQUESTS, request)
+        if bonus_slot.allowed:
+            return bonus_slot
+
+    raise HTTPException(
+        status_code=429,
+        detail=(
+            f"Se alcanzo el limite diario de {MAX_DAILY_PAID_CHAT_REQUESTS + (MAX_DAILY_BONUS_CHAT_REQUESTS if GOOGLE_BONUS_API_KEY else 0)} "
+            f"consultas con IA para {paid_slot.usage_day}. Intenta de nuevo manana."
+        ),
+    )
+
+
+def get_mime_type(file_path: str, file_name: str) -> str:
+    guessed, _ = mimetypes.guess_type(file_name or file_path)
+    return guessed or "application/octet-stream"
+
+
+def extract_rest_error_message(response: requests.Response) -> str:
+    try:
+        payload = response.json()
+        return payload.get("error", {}).get("message") or response.text
+    except Exception:
+        return response.text
+
+
+def generate_bonus_text_with_fallback(model_names: list[str], prompt: str) -> tuple[str, str]:
+    if not GOOGLE_BONUS_API_KEY:
+        raise RuntimeError("No se configuro GOOGLE_AI_KEY_BONUS_FREE.")
+
+    last_error = None
+    for model_name in model_names:
+        try:
+            response = requests.post(
+                f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent",
+                params={"key": GOOGLE_BONUS_API_KEY},
+                json={"contents": [{"role": "user", "parts": [{"text": prompt}]}]},
+                timeout=120,
+            )
+            if not response.ok:
+                raise RuntimeError(extract_rest_error_message(response))
+            payload = response.json()
+            parts = payload.get("candidates", [{}])[0].get("content", {}).get("parts", [])
+            text = "".join(part.get("text", "") for part in parts if part.get("text"))
+            if not text:
+                raise RuntimeError("Gemini no devolvio texto utilizable.")
+            return text, model_name
+        except Exception as exc:
+            last_error = exc
+            if is_quota_error(str(exc)):
+                continue
+
+    raise last_error or RuntimeError("No se pudo generar respuesta bonus.")
+
+
+def upload_bonus_file(file_path: str, display_name: str, mime_type: str) -> dict:
+    file_size = os.path.getsize(file_path)
+    start_response = requests.post(
+        "https://generativelanguage.googleapis.com/upload/v1beta/files",
+        params={"key": GOOGLE_BONUS_API_KEY},
+        headers={
+            "X-Goog-Upload-Protocol": "resumable",
+            "X-Goog-Upload-Command": "start",
+            "X-Goog-Upload-Header-Content-Length": str(file_size),
+            "X-Goog-Upload-Header-Content-Type": mime_type,
+            "Content-Type": "application/json",
+        },
+        json={"file": {"display_name": display_name}},
+        timeout=120,
+    )
+    if not start_response.ok:
+        raise RuntimeError(extract_rest_error_message(start_response))
+
+    upload_url = start_response.headers.get("X-Goog-Upload-URL")
+    if not upload_url:
+        raise RuntimeError("No se recibio URL de carga para el archivo bonus.")
+
+    with open(file_path, "rb") as handle:
+        upload_response = requests.post(
+            upload_url,
+            headers={
+                "Content-Length": str(file_size),
+                "X-Goog-Upload-Offset": "0",
+                "X-Goog-Upload-Command": "upload, finalize",
+            },
+            data=handle.read(),
+            timeout=120,
         )
-    return usage_day
+
+    if not upload_response.ok:
+        raise RuntimeError(extract_rest_error_message(upload_response))
+
+    return upload_response.json().get("file", {})
+
+
+def wait_for_bonus_file(file_name: str) -> dict:
+    started_at = time.time()
+    resource_name = file_name if file_name.startswith("files/") else f"files/{file_name}"
+
+    while True:
+        response = requests.get(
+            f"https://generativelanguage.googleapis.com/v1beta/{resource_name}",
+            params={"key": GOOGLE_BONUS_API_KEY},
+            timeout=60,
+        )
+        if not response.ok:
+            raise RuntimeError(extract_rest_error_message(response))
+        payload = response.json()
+        state = (payload.get("state") or {}).get("name", "")
+        if state == "ACTIVE":
+            return payload
+        if state and state != "PROCESSING":
+            raise RuntimeError(f"El archivo bonus no quedo listo. Estado: {state}")
+        if time.time() - started_at > GOOGLE_FILE_PROCESS_TIMEOUT:
+            raise TimeoutError("La carga del documento bonus hacia Gemini tardo demasiado.")
+        time.sleep(GOOGLE_POLL_SECONDS)
+
+
+def generate_bonus_document_with_fallback(file_path: str, display_name: str, prompt: str) -> tuple[str, str]:
+    mime_type = get_mime_type(file_path, display_name)
+    last_error = None
+
+    for model_name in BONUS_DOC_MODEL_CANDIDATES:
+        try:
+            uploaded_file = upload_bonus_file(file_path, display_name, mime_type)
+            ready_file = wait_for_bonus_file(uploaded_file.get("name", ""))
+            response = requests.post(
+                f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent",
+                params={"key": GOOGLE_BONUS_API_KEY},
+                json={
+                    "contents": [
+                        {
+                            "role": "user",
+                            "parts": [
+                                {"file_data": {"mime_type": mime_type, "file_uri": ready_file.get("uri")}},
+                                {"text": prompt},
+                            ],
+                        }
+                    ]
+                },
+                timeout=180,
+            )
+            if not response.ok:
+                raise RuntimeError(extract_rest_error_message(response))
+            payload = response.json()
+            parts = payload.get("candidates", [{}])[0].get("content", {}).get("parts", [])
+            text = "".join(part.get("text", "") for part in parts if part.get("text"))
+            if not text:
+                raise RuntimeError("Gemini bonus no devolvio texto utilizable.")
+            return text, model_name
+        except Exception as exc:
+            last_error = exc
+            if is_quota_error(str(exc)):
+                continue
+
+    raise last_error or RuntimeError("No se pudo generar respuesta bonus de documento.")
 
 
 def update_index_status(document_id: str, **updates) -> None:
@@ -801,8 +996,8 @@ def enrich_chunk_matches(matches: list[dict]) -> list[dict]:
     return enriched
 
 
-def search_documents_semantic(query: str, match_count: int = 8) -> list[dict]:
-    query_embedding = embed_query_with_fallback(query)
+def search_documents_semantic(query: str, match_count: int = 8, api_key: Optional[str] = None) -> list[dict]:
+    query_embedding = embed_query_with_fallback(query, api_key=api_key)
     response = supabase.rpc(
         "match_document_chunks_hybrid",
         {
@@ -905,23 +1100,31 @@ async def queue_index_pending(
 @app.post("/ask")
 async def ask_document(request: ChatRequest):
     try:
+        chat_slot = reserve_daily_google_request_budget(request)
+
         if request.document_id:
             try:
-                reserve_daily_google_request_budget(request)
-                google_file = get_or_upload_to_google(request.document_id)
-                response, model_name = generate_with_fallback(
-                    DOC_MODEL_CANDIDATES,
-                    [
-                        google_file,
-                        (
-                            "Eres SIGED-IA, asistente legal experto. "
-                            "Responde basandote unicamente en este documento. "
-                            "Si la pregunta es general, resume el contenido principal del documento en lenguaje claro.\n"
-                            f"Pregunta: {request.message}"
-                        ),
-                    ],
+                prompt = (
+                    "Eres SIGED-IA, asistente legal experto. "
+                    "Responde basandote unicamente en este documento. "
+                    "Si la pregunta es general, resume el contenido principal del documento en lenguaje claro.\n"
+                    f"Pregunta: {request.message}"
                 )
-                return {"answer": response.text, "model": f"{model_name} (Doc Mode)"}
+
+                if chat_slot.tier == "paid":
+                    google_file = get_or_upload_to_google(request.document_id)
+                    response, model_name = generate_with_fallback(DOC_MODEL_CANDIDATES, [google_file, prompt])
+                    return {"answer": extract_response_text(response), "model": f"{model_name} (Doc Mode)"}
+
+                doc_record = supabase.table("documents").select("id,name,file_path").eq("id", request.document_id).single().execute()
+                doc_data = doc_record.data or {}
+                temp_path = download_document_to_temp(doc_data)
+                try:
+                    answer, model_name = generate_bonus_document_with_fallback(temp_path, doc_data.get("name", "Documento"), prompt)
+                finally:
+                    if os.path.exists(temp_path):
+                        os.remove(temp_path)
+                return {"answer": prepend_bonus_notice(answer, chat_slot), "model": f"{model_name} (Bonus Doc Mode)"}
             except Exception as exc:
                 if is_quota_error(str(exc)):
                     raise HTTPException(
@@ -932,12 +1135,13 @@ async def ask_document(request: ChatRequest):
 
         if looks_like_general_chat(request.message):
             try:
-                reserve_daily_google_request_budget(request)
-                response, model_name = generate_with_fallback(
-                    GENERAL_MODEL_CANDIDATES,
-                    f"Eres SIGED-IA, un asistente juridico experto. Responde de forma breve y natural a esto: {request.message}",
-                )
-                return {"answer": response.text, "model": f"{model_name} (General Mode)", "sources": []}
+                prompt = f"Eres SIGED-IA, un asistente juridico experto. Responde de forma breve y natural a esto: {request.message}"
+                if chat_slot.tier == "paid":
+                    response, model_name = generate_with_fallback(GENERAL_MODEL_CANDIDATES, prompt)
+                    return {"answer": extract_response_text(response), "model": f"{model_name} (General Mode)", "sources": []}
+
+                answer, model_name = generate_bonus_text_with_fallback(BONUS_GENERAL_MODEL_CANDIDATES, prompt)
+                return {"answer": prepend_bonus_notice(answer, chat_slot), "model": f"{model_name} (Bonus General Mode)", "sources": []}
             except Exception as exc:
                 if is_quota_error(str(exc)):
                     return {"answer": general_chat_fallback(request.message), "model": "Modo General (Respaldo local)", "sources": []}
@@ -945,25 +1149,32 @@ async def ask_document(request: ChatRequest):
 
         if should_search_knowledge_base(request.message):
             try:
-                reserve_daily_google_request_budget(request)
-                semantic_matches = search_documents_semantic(request.message)
+                semantic_matches = search_documents_semantic(
+                    request.message,
+                    api_key=GOOGLE_BONUS_API_KEY if chat_slot.tier == "bonus" else None,
+                )
                 if semantic_matches:
                     evidence_blocks = build_semantic_evidence_blocks(semantic_matches)
-                    response, model_name = generate_with_fallback(
-                        GENERAL_MODEL_CANDIDATES,
-                        (
-                            "Eres SIGED-IA, un asistente juridico experto. "
-                            "Responde usando solo la evidencia documental suministrada. "
-                            "No inventes datos fuera de los extractos. "
-                            "Si la evidencia es parcial o insuficiente, dilo claramente. "
-                            "Menciona los documentos fuente cuando sustenten la respuesta.\n\n"
-                            f"Pregunta del usuario: {request.message}\n\n"
-                            f"Evidencia documental recuperada por busqueda semantica/hibrida:\n{evidence_blocks}"
-                        ),
+                    prompt = (
+                        "Eres SIGED-IA, un asistente juridico experto. "
+                        "Responde usando solo la evidencia documental suministrada. "
+                        "No inventes datos fuera de los extractos. "
+                        "Si la evidencia es parcial o insuficiente, dilo claramente. "
+                        "Menciona los documentos fuente cuando sustenten la respuesta.\n\n"
+                        f"Pregunta del usuario: {request.message}\n\n"
+                        f"Evidencia documental recuperada por busqueda semantica/hibrida:\n{evidence_blocks}"
                     )
+                    if chat_slot.tier == "paid":
+                        response, model_name = generate_with_fallback(GENERAL_MODEL_CANDIDATES, prompt)
+                        answer = extract_response_text(response)
+                        model_label = f"{model_name} (RAG Semantico)"
+                    else:
+                        answer, model_name = generate_bonus_text_with_fallback(BONUS_GENERAL_MODEL_CANDIDATES, prompt)
+                        answer = prepend_bonus_notice(answer, chat_slot)
+                        model_label = f"{model_name} (Bonus RAG Semantico)"
                     return {
-                        "answer": response.text,
-                        "model": f"{model_name} (RAG Semantico)",
+                        "answer": answer,
+                        "model": model_label,
                         "sources": dedupe_sources(semantic_matches),
                     }
             except Exception as exc:
@@ -990,20 +1201,25 @@ async def ask_document(request: ChatRequest):
                     evidence_blocks = "\n\n".join(
                         [f"Documento: {item['name']}\nExtracto: {item['excerpt']}" for item in matches if item["content_match"]]
                     )
-                    response, model_name = generate_with_fallback(
-                        GENERAL_MODEL_CANDIDATES,
-                        (
-                            "Eres SIGED-IA, un asistente juridico experto. "
-                            "Responde usando solo la evidencia documental suministrada. "
-                            "Si la evidencia no es suficiente, dilo claramente. "
-                            "Indica de forma clara si la informacion aparece o no en la base documental.\n\n"
-                            f"Pregunta del usuario: {request.message}\n\n"
-                            f"Evidencia documental:\n{evidence_blocks}"
-                        ),
+                    prompt = (
+                        "Eres SIGED-IA, un asistente juridico experto. "
+                        "Responde usando solo la evidencia documental suministrada. "
+                        "Si la evidencia no es suficiente, dilo claramente. "
+                        "Indica de forma clara si la informacion aparece o no en la base documental.\n\n"
+                        f"Pregunta del usuario: {request.message}\n\n"
+                        f"Evidencia documental:\n{evidence_blocks}"
                     )
+                    if chat_slot.tier == "paid":
+                        response, model_name = generate_with_fallback(GENERAL_MODEL_CANDIDATES, prompt)
+                        answer = extract_response_text(response)
+                        model_label = f"{model_name} (Busqueda Global)"
+                    else:
+                        answer, model_name = generate_bonus_text_with_fallback(BONUS_GENERAL_MODEL_CANDIDATES, prompt)
+                        answer = prepend_bonus_notice(answer, chat_slot)
+                        model_label = f"{model_name} (Bonus Busqueda Global)"
                     return {
-                        "answer": response.text,
-                        "model": f"{model_name} (Busqueda Global)",
+                        "answer": answer,
+                        "model": model_label,
                         "sources": [{"id": item["id"], "name": item["name"]} for item in matches],
                     }
                 except Exception as exc:
@@ -1026,24 +1242,26 @@ async def ask_document(request: ChatRequest):
 
         if looks_like_general_knowledge(request.message):
             try:
-                reserve_daily_google_request_budget(request)
-                response, model_name = generate_with_fallback(
-                    GENERAL_MODEL_CANDIDATES,
-                    f"Eres SIGED-IA, un asistente juridico experto. Responde de forma clara y breve a esto: {request.message}",
-                )
-                return {"answer": response.text, "model": f"{model_name} (General Mode)", "sources": []}
+                prompt = f"Eres SIGED-IA, un asistente juridico experto. Responde de forma clara y breve a esto: {request.message}"
+                if chat_slot.tier == "paid":
+                    response, model_name = generate_with_fallback(GENERAL_MODEL_CANDIDATES, prompt)
+                    return {"answer": extract_response_text(response), "model": f"{model_name} (General Mode)", "sources": []}
+
+                answer, model_name = generate_bonus_text_with_fallback(BONUS_GENERAL_MODEL_CANDIDATES, prompt)
+                return {"answer": prepend_bonus_notice(answer, chat_slot), "model": f"{model_name} (Bonus General Mode)", "sources": []}
             except Exception as exc:
                 if is_quota_error(str(exc)):
                     return {"answer": general_chat_fallback(request.message), "model": "Modo General (Respaldo local)", "sources": []}
                 raise
 
         try:
-            reserve_daily_google_request_budget(request)
-            response, model_name = generate_with_fallback(
-                GENERAL_MODEL_CANDIDATES,
-                f"Eres SIGED-IA, un asistente juridico experto. Responde de forma breve y util a esto: {request.message}",
-            )
-            return {"answer": response.text, "model": f"{model_name} (General Mode)", "sources": []}
+            prompt = f"Eres SIGED-IA, un asistente juridico experto. Responde de forma breve y util a esto: {request.message}"
+            if chat_slot.tier == "paid":
+                response, model_name = generate_with_fallback(GENERAL_MODEL_CANDIDATES, prompt)
+                return {"answer": extract_response_text(response), "model": f"{model_name} (General Mode)", "sources": []}
+
+            answer, model_name = generate_bonus_text_with_fallback(BONUS_GENERAL_MODEL_CANDIDATES, prompt)
+            return {"answer": prepend_bonus_notice(answer, chat_slot), "model": f"{model_name} (Bonus General Mode)", "sources": []}
         except Exception as exc:
             if is_quota_error(str(exc)):
                 return {"answer": general_chat_fallback(request.message), "model": "Modo General (Respaldo local)", "sources": []}

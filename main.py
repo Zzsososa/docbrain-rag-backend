@@ -35,12 +35,14 @@ SUPABASE_URL = os.getenv("NEXT_PUBLIC_SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 GOOGLE_API_KEY = os.getenv("GOOGLE_AI_KEY")
 GOOGLE_BONUS_API_KEY = os.getenv("GOOGLE_AI_KEY_BONUS_FREE")
-DOC_MODEL = os.getenv("GOOGLE_DOC_MODEL", "gemini-1.5-flash")
-GENERAL_MODEL = os.getenv("GOOGLE_GENERAL_MODEL", "gemini-1.5-flash")
+DEFAULT_TEXT_MODEL = "gemini-2.5-flash-lite"
+DEFAULT_TEXT_FALLBACK_MODELS = "gemini-2.5-flash,gemini-2.0-flash"
+DOC_MODEL = os.getenv("GOOGLE_DOC_MODEL", DEFAULT_TEXT_MODEL)
+GENERAL_MODEL = os.getenv("GOOGLE_GENERAL_MODEL", DEFAULT_TEXT_MODEL)
 DOC_MODELS = os.getenv("GOOGLE_DOC_MODELS", DOC_MODEL)
 GENERAL_MODELS = os.getenv("GOOGLE_GENERAL_MODELS", GENERAL_MODEL)
-BONUS_DOC_MODEL = os.getenv("GOOGLE_BONUS_DOC_MODEL", "gemini-1.5-flash")
-BONUS_GENERAL_MODEL = os.getenv("GOOGLE_BONUS_GENERAL_MODEL", "gemini-1.5-flash")
+BONUS_DOC_MODEL = os.getenv("GOOGLE_BONUS_DOC_MODEL", DEFAULT_TEXT_MODEL)
+BONUS_GENERAL_MODEL = os.getenv("GOOGLE_BONUS_GENERAL_MODEL", DEFAULT_TEXT_MODEL)
 BONUS_DOC_MODELS = os.getenv("GOOGLE_BONUS_DOC_MODELS", BONUS_DOC_MODEL)
 BONUS_GENERAL_MODELS = os.getenv("GOOGLE_BONUS_GENERAL_MODELS", BONUS_GENERAL_MODEL)
 GOOGLE_MAX_RETRIES = int(os.getenv("GOOGLE_MAX_RETRIES", "2"))
@@ -151,10 +153,33 @@ def parse_model_candidates(raw_models: str, fallback: str) -> list[str]:
     return candidates
 
 
-DOC_MODEL_CANDIDATES = parse_model_candidates(DOC_MODELS, DOC_MODEL)
-GENERAL_MODEL_CANDIDATES = parse_model_candidates(GENERAL_MODELS, GENERAL_MODEL)
-BONUS_DOC_MODEL_CANDIDATES = parse_model_candidates(BONUS_DOC_MODELS, BONUS_DOC_MODEL)
-BONUS_GENERAL_MODEL_CANDIDATES = parse_model_candidates(BONUS_GENERAL_MODELS, BONUS_GENERAL_MODEL)
+def upgrade_legacy_model_candidates(model_names: list[str], fallback_defaults: list[str]) -> list[str]:
+    upgraded: list[str] = []
+    legacy_aliases = {
+        "gemini-1.5-flash": [DEFAULT_TEXT_MODEL, *fallback_defaults],
+        "gemini-1.5-flash-latest": [DEFAULT_TEXT_MODEL, *fallback_defaults],
+        "gemini-1.5-pro": ["gemini-2.5-flash", "gemini-2.0-flash", *fallback_defaults],
+        "gemini-pro": [DEFAULT_TEXT_MODEL, *fallback_defaults],
+    }
+
+    for model_name in model_names:
+        replacements = legacy_aliases.get(model_name, [model_name])
+        for replacement in replacements:
+            if replacement and replacement not in upgraded:
+                upgraded.append(replacement)
+
+    for model_name in fallback_defaults:
+        if model_name and model_name not in upgraded:
+            upgraded.append(model_name)
+
+    return upgraded
+
+
+DEFAULT_TEXT_CANDIDATES = parse_model_candidates(DEFAULT_TEXT_FALLBACK_MODELS, DEFAULT_TEXT_MODEL)
+DOC_MODEL_CANDIDATES = upgrade_legacy_model_candidates(parse_model_candidates(DOC_MODELS, DOC_MODEL), DEFAULT_TEXT_CANDIDATES)
+GENERAL_MODEL_CANDIDATES = upgrade_legacy_model_candidates(parse_model_candidates(GENERAL_MODELS, GENERAL_MODEL), DEFAULT_TEXT_CANDIDATES)
+BONUS_DOC_MODEL_CANDIDATES = upgrade_legacy_model_candidates(parse_model_candidates(BONUS_DOC_MODELS, BONUS_DOC_MODEL), DEFAULT_TEXT_CANDIDATES)
+BONUS_GENERAL_MODEL_CANDIDATES = upgrade_legacy_model_candidates(parse_model_candidates(BONUS_GENERAL_MODELS, BONUS_GENERAL_MODEL), DEFAULT_TEXT_CANDIDATES)
 EMBEDDING_MODEL_CANDIDATES = parse_model_candidates(EMBEDDING_MODELS, "models/gemini-embedding-001")
 
 
@@ -186,6 +211,11 @@ def extract_terms(text: str) -> list[str]:
 def is_quota_error(message: str) -> bool:
     lowered = message.lower()
     return "quota exceeded" in lowered or "429" in lowered or "rate limit" in lowered
+
+
+def is_model_not_found_error(message: str) -> bool:
+    lowered = message.lower()
+    return "not found" in lowered or "not_found" in lowered or "404" in lowered
 
 
 def is_daily_embedding_quota_error(message: str) -> bool:
@@ -257,7 +287,7 @@ def generate_with_fallback(model_names: list[str], payload):
             return response, model_name
         except Exception as exc:
             last_error = exc
-            if is_quota_error(str(exc)):
+            if is_quota_error(str(exc)) or is_model_not_found_error(str(exc)):
                 continue
             raise
 
@@ -442,7 +472,7 @@ def generate_bonus_text_with_fallback(model_names: list[str], prompt: str) -> tu
             return text, model_name
         except Exception as exc:
             last_error = exc
-            if is_quota_error(str(exc)):
+            if is_quota_error(str(exc)) or is_model_not_found_error(str(exc)):
                 continue
 
     raise last_error or RuntimeError("No se pudo generar respuesta bonus.")
@@ -545,7 +575,7 @@ def generate_bonus_document_with_fallback(file_path: str, display_name: str, pro
             return text, model_name
         except Exception as exc:
             last_error = exc
-            if is_quota_error(str(exc)):
+            if is_quota_error(str(exc)) or is_model_not_found_error(str(exc)):
                 continue
 
     raise last_error or RuntimeError("No se pudo generar respuesta bonus de documento.")

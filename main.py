@@ -313,6 +313,14 @@ def prepend_bonus_notice(answer: str, slot: ChatUsageReservation) -> str:
     return f"{notice}\n\n{answer}" if notice else answer
 
 
+def can_use_bonus_failover() -> bool:
+    return bool(GOOGLE_BONUS_API_KEY)
+
+
+def is_failover_eligible_error(message: str) -> bool:
+    return is_quota_error(message) or is_model_not_found_error(message)
+
+
 def get_embeddings_model(model_name: str, api_key: Optional[str] = None) -> GoogleGenerativeAIEmbeddings:
     cache_key = f"{api_key or GOOGLE_API_KEY}:{model_name}"
     if cache_key not in embeddings_model_cache:
@@ -1115,6 +1123,18 @@ def search_documents_semantic(query: str, match_count: int = 8, api_key: Optiona
     return enrich_chunk_matches(response.data or [])
 
 
+def search_documents_semantic_with_failover(query: str, chat_slot: ChatUsageReservation, match_count: int = 8) -> tuple[list[dict], str]:
+    if chat_slot.tier == "bonus":
+        return search_documents_semantic(query, match_count=match_count, api_key=GOOGLE_BONUS_API_KEY), "bonus"
+
+    try:
+        return search_documents_semantic(query, match_count=match_count), "paid"
+    except Exception as exc:
+        if can_use_bonus_failover() and is_failover_eligible_error(str(exc)):
+            return search_documents_semantic(query, match_count=match_count, api_key=GOOGLE_BONUS_API_KEY), "bonus_failover"
+        raise
+
+
 def build_semantic_evidence_blocks(matches: list[dict], max_chars: int = 9000) -> str:
     blocks = []
     current_length = 0
@@ -1185,6 +1205,52 @@ def no_documentary_evidence_answer() -> str:
     )
 
 
+def generate_text_answer_with_failover(prompt: str, chat_slot: ChatUsageReservation, mode_label: str) -> tuple[str, str]:
+    if chat_slot.tier == "bonus":
+        answer, model_name = generate_bonus_text_with_fallback(BONUS_GENERAL_MODEL_CANDIDATES, prompt)
+        return prepend_bonus_notice(answer, chat_slot), f"{model_name} (Bonus {mode_label})"
+
+    try:
+        response, model_name = generate_with_fallback(GENERAL_MODEL_CANDIDATES, prompt)
+        return extract_response_text(response), f"{model_name} ({mode_label})"
+    except Exception as exc:
+        if can_use_bonus_failover() and is_failover_eligible_error(str(exc)):
+            answer, model_name = generate_bonus_text_with_fallback(BONUS_GENERAL_MODEL_CANDIDATES, prompt)
+            return answer, f"{model_name} (API Secundaria {mode_label})"
+        raise
+
+
+def generate_document_answer_with_failover(document_id: str, prompt: str, chat_slot: ChatUsageReservation) -> tuple[str, str]:
+    if chat_slot.tier == "bonus":
+        doc_record = supabase.table("documents").select("id,name,file_path").eq("id", document_id).single().execute()
+        doc_data = doc_record.data or {}
+        temp_path = download_document_to_temp(doc_data)
+        try:
+            answer, model_name = generate_bonus_document_with_fallback(temp_path, doc_data.get("name", "Documento"), prompt)
+        finally:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+        return prepend_bonus_notice(answer, chat_slot), f"{model_name} (Bonus Doc Mode)"
+
+    try:
+        google_file = get_or_upload_to_google(document_id)
+        response, model_name = generate_with_fallback(DOC_MODEL_CANDIDATES, [google_file, prompt])
+        return extract_response_text(response), f"{model_name} (Doc Mode)"
+    except Exception as exc:
+        if not (can_use_bonus_failover() and is_failover_eligible_error(str(exc))):
+            raise
+
+        doc_record = supabase.table("documents").select("id,name,file_path").eq("id", document_id).single().execute()
+        doc_data = doc_record.data or {}
+        temp_path = download_document_to_temp(doc_data)
+        try:
+            answer, model_name = generate_bonus_document_with_fallback(temp_path, doc_data.get("name", "Documento"), prompt)
+        finally:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+        return answer, f"{model_name} (API Secundaria Doc Mode)"
+
+
 @app.post("/jobs/index-document/{document_id}", response_model=JobResponse, status_code=202)
 async def queue_index_document(
     document_id: str,
@@ -1221,21 +1287,8 @@ async def ask_document(request: ChatRequest):
                     "Si la pregunta es general, resume el contenido principal del documento en lenguaje claro.\n"
                     f"Pregunta: {request.message}"
                 )
-
-                if chat_slot.tier == "paid":
-                    google_file = get_or_upload_to_google(request.document_id)
-                    response, model_name = generate_with_fallback(DOC_MODEL_CANDIDATES, [google_file, prompt])
-                    return {"answer": extract_response_text(response), "model": f"{model_name} (Doc Mode)"}
-
-                doc_record = supabase.table("documents").select("id,name,file_path").eq("id", request.document_id).single().execute()
-                doc_data = doc_record.data or {}
-                temp_path = download_document_to_temp(doc_data)
-                try:
-                    answer, model_name = generate_bonus_document_with_fallback(temp_path, doc_data.get("name", "Documento"), prompt)
-                finally:
-                    if os.path.exists(temp_path):
-                        os.remove(temp_path)
-                return {"answer": prepend_bonus_notice(answer, chat_slot), "model": f"{model_name} (Bonus Doc Mode)"}
+                answer, model_name = generate_document_answer_with_failover(request.document_id, prompt, chat_slot)
+                return {"answer": answer, "model": model_name}
             except Exception as exc:
                 if is_quota_error(str(exc)):
                     raise HTTPException(
@@ -1248,10 +1301,7 @@ async def ask_document(request: ChatRequest):
             return {"answer": general_chat_fallback(request.message), "model": "Saludo", "sources": []}
 
         try:
-            semantic_matches = search_documents_semantic(
-                request.message,
-                api_key=GOOGLE_BONUS_API_KEY if chat_slot.tier == "bonus" else None,
-            )
+            semantic_matches, semantic_mode = search_documents_semantic_with_failover(request.message, chat_slot)
             if semantic_matches:
                 evidence_blocks = build_semantic_evidence_blocks(semantic_matches)
                 prompt = (
@@ -1263,14 +1313,11 @@ async def ask_document(request: ChatRequest):
                     f"Pregunta del usuario: {request.message}\n\n"
                     f"Evidencia documental recuperada por busqueda semantica/hibrida:\n{evidence_blocks}"
                 )
-                if chat_slot.tier == "paid":
-                    response, model_name = generate_with_fallback(GENERAL_MODEL_CANDIDATES, prompt)
-                    answer = extract_response_text(response)
-                    model_label = f"{model_name} (RAG Semantico)"
-                else:
-                    answer, model_name = generate_bonus_text_with_fallback(BONUS_GENERAL_MODEL_CANDIDATES, prompt)
-                    answer = prepend_bonus_notice(answer, chat_slot)
-                    model_label = f"{model_name} (Bonus RAG Semantico)"
+                answer, model_label = generate_text_answer_with_failover(
+                    prompt,
+                    chat_slot,
+                    "RAG Semantico" if semantic_mode != "bonus_failover" else "RAG Semantico con API Secundaria",
+                )
                 return {
                     "answer": answer,
                     "model": model_label,
@@ -1308,14 +1355,7 @@ async def ask_document(request: ChatRequest):
                     f"Pregunta del usuario: {request.message}\n\n"
                     f"Evidencia documental:\n{evidence_blocks}"
                 )
-                if chat_slot.tier == "paid":
-                    response, model_name = generate_with_fallback(GENERAL_MODEL_CANDIDATES, prompt)
-                    answer = extract_response_text(response)
-                    model_label = f"{model_name} (Busqueda Global)"
-                else:
-                    answer, model_name = generate_bonus_text_with_fallback(BONUS_GENERAL_MODEL_CANDIDATES, prompt)
-                    answer = prepend_bonus_notice(answer, chat_slot)
-                    model_label = f"{model_name} (Bonus Busqueda Global)"
+                answer, model_label = generate_text_answer_with_failover(prompt, chat_slot, "Busqueda Global")
                 return {
                     "answer": answer,
                     "model": model_label,

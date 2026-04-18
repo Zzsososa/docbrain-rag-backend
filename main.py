@@ -5,7 +5,7 @@ import unicodedata
 import mimetypes
 from pathlib import Path
 import tempfile
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 from dataclasses import dataclass
 import requests
@@ -148,6 +148,7 @@ class ChatUsageReservation:
     usage_day: str
     used_count: int
     limit_count: int
+    reset_at: Optional[str] = None
 
 
 def parse_model_candidates(raw_models: str, fallback: str) -> list[str]:
@@ -394,38 +395,81 @@ def get_usage_day() -> str:
         return datetime.now(timezone.utc).date().isoformat()
 
 
-def count_usage_events(event_type: str, usage_day: Optional[str] = None) -> int:
-    target_day = usage_day or get_usage_day()
+def get_usage_window_start() -> datetime:
+    now = datetime.now(timezone.utc)
+    return now - timedelta(hours=24)
+
+
+def count_usage_events(event_type: str, created_after: Optional[str] = None) -> int:
+    target_start = created_after or get_usage_window_start().isoformat()
     response = (
         supabase.table("ai_usage_events")
         .select("id", count="exact")
         .eq("event_type", event_type)
-        .eq("usage_day", target_day)
+        .gte("created_at", target_start)
         .execute()
     )
     return response.count or 0
 
 
+def get_oldest_usage_event_timestamp(event_type: str, created_after: Optional[str] = None) -> Optional[str]:
+    target_start = created_after or get_usage_window_start().isoformat()
+    response = (
+        supabase.table("ai_usage_events")
+        .select("created_at")
+        .eq("event_type", event_type)
+        .gte("created_at", target_start)
+        .order("created_at", desc=False)
+        .limit(1)
+        .execute()
+    )
+    records = response.data or []
+    if not records:
+        return None
+    return records[0].get("created_at")
+
+
 def reserve_slot(event_type: str, daily_limit: int, request: ChatRequest) -> ChatUsageReservation:
-    response = supabase.rpc(
-        "reserve_daily_ai_usage_slot",
+    window_start = get_usage_window_start().isoformat()
+    current_count = count_usage_events(event_type, window_start)
+
+    if current_count >= daily_limit:
+        oldest_created_at = get_oldest_usage_event_timestamp(event_type, window_start)
+        reset_at = None
+        if oldest_created_at:
+            try:
+                reset_at = (datetime.fromisoformat(oldest_created_at.replace("Z", "+00:00")) + timedelta(hours=24)).isoformat()
+            except Exception:
+                reset_at = None
+
+        return ChatUsageReservation(
+            allowed=False,
+            tier="paid" if event_type == "chat_paid_request" else "bonus",
+            usage_day=get_usage_day(),
+            used_count=current_count,
+            limit_count=daily_limit,
+            reset_at=reset_at,
+        )
+
+    supabase.table("ai_usage_events").insert(
         {
-            "p_event_type": event_type,
-            "p_daily_limit": daily_limit,
-            "p_resource_id": request.document_id,
-            "p_metadata": {
+            "event_type": event_type,
+            "resource_id": request.document_id,
+            "metadata": {
                 "message_length": len(request.message or ""),
                 "document_mode": bool(request.document_id),
             },
-        },
+            "usage_day": get_usage_day(),
+        }
     ).execute()
-    slot = (response.data or [{}])[0]
+
     return ChatUsageReservation(
-        allowed=bool(slot.get("allowed", False)),
+        allowed=True,
         tier="paid" if event_type == "chat_paid_request" else "bonus",
-        usage_day=slot.get("usage_day") or get_usage_day(),
-        used_count=int(slot.get("used_count") or 0),
-        limit_count=int(slot.get("limit_count") or daily_limit),
+        usage_day=get_usage_day(),
+        used_count=current_count + 1,
+        limit_count=daily_limit,
+        reset_at=(datetime.now(timezone.utc) + timedelta(hours=24)).isoformat(),
     )
 
 
@@ -442,8 +486,9 @@ def reserve_daily_google_request_budget(request: ChatRequest) -> ChatUsageReserv
     raise HTTPException(
         status_code=429,
         detail=(
-            f"Se alcanzo el limite diario de {MAX_DAILY_PAID_CHAT_REQUESTS + (MAX_DAILY_BONUS_CHAT_REQUESTS if GOOGLE_BONUS_API_KEY else 0)} "
-            f"consultas con IA para {paid_slot.usage_day}. Intenta de nuevo manana."
+            f"Se alcanzo el limite de {MAX_DAILY_PAID_CHAT_REQUESTS + (MAX_DAILY_BONUS_CHAT_REQUESTS if GOOGLE_BONUS_API_KEY else 0)} "
+            f"consultas con IA en una ventana movil de 24 horas."
+            + (f" El cupo volvera a liberarse a partir de {paid_slot.reset_at}." if paid_slot.reset_at else "")
         ),
     )
 

@@ -1237,9 +1237,9 @@ def build_name_only_guidance(matches: list[dict]) -> str:
 def general_chat_fallback(message: str) -> str:
     normalized = normalize_text(message).strip(" ?!.,")
     if normalized in ("hola", "hello", "helloo", "buenas", "buenos dias", "buenas tardes", "buenas noches"):
-        return "Hola. Soy SIGED-IA, tu asistente juridico. Puedo ayudarte con preguntas generales o buscar informacion dentro de tus documentos."
+        return "Hola. Soy DocBrain, tu asistente juridico. Puedo ayudarte con preguntas generales o buscar informacion dentro de tus documentos."
     if normalized == "quien eres":
-        return "Soy SIGED-IA, un asistente juridico para consultar documentos y responder preguntas basadas en tu base documental."
+        return "Soy DocBrain, un asistente juridico para consultar documentos y responder preguntas basadas en tu base documental."
     return "Puedo ayudarte con consultas juridicas generales y con la busqueda de informacion dentro de los documentos que has subido."
 
 
@@ -1327,7 +1327,7 @@ async def ask_document(request: ChatRequest):
         if request.document_id:
             try:
                 prompt = (
-                    "Eres SIGED-IA, asistente legal experto. "
+                    "Eres DocBrain, asistente legal experto. "
                     "Responde basandote unicamente en este documento. "
                     "Si la pregunta es general, resume el contenido principal del documento en lenguaje claro.\n"
                     f"Pregunta: {request.message}"
@@ -1350,7 +1350,7 @@ async def ask_document(request: ChatRequest):
             if semantic_matches:
                 evidence_blocks = build_semantic_evidence_blocks(semantic_matches)
                 prompt = (
-                    "Eres SIGED-IA, un asistente juridico experto. "
+                    "Eres DocBrain, un asistente juridico experto. "
                     "Responde usando solo la evidencia documental suministrada. "
                     "No inventes datos fuera de los extractos. "
                     "Si la evidencia es parcial o insuficiente, dilo claramente. "
@@ -1393,7 +1393,7 @@ async def ask_document(request: ChatRequest):
                     [f"Documento: {item['name']}\nExtracto: {item['excerpt']}" for item in matches if item["content_match"]]
                 )
                 prompt = (
-                    "Eres SIGED-IA, un asistente juridico experto. "
+                    "Eres DocBrain, un asistente juridico experto. "
                     "Responde usando solo la evidencia documental suministrada. "
                     "Si la evidencia no es suficiente, dilo claramente. "
                     "Indica de forma clara si la informacion aparece o no en la base documental.\n\n"

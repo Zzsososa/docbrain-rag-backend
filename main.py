@@ -137,6 +137,10 @@ class DailyEmbeddingQuotaError(Exception):
     pass
 
 
+class EmbeddingRateLimitError(Exception):
+    pass
+
+
 @dataclass
 class ChatUsageReservation:
     allowed: bool
@@ -707,13 +711,16 @@ def insert_chunk_batch(document_id: str, doc_name: str, chunks: list[dict], star
             if is_daily_embedding_quota_error(str(exc)):
                 raise DailyEmbeddingQuotaError(str(exc)) from exc
 
-            if not is_quota_error(str(exc)) or attempt >= EMBEDDING_MAX_RETRIES:
+            if not is_quota_error(str(exc)):
                 raise
+
+            if attempt >= EMBEDDING_MAX_RETRIES:
+                raise EmbeddingRateLimitError(str(exc)) from exc
 
             wait_seconds = extract_retry_delay_seconds(str(exc)) or EMBEDDING_RATE_LIMIT_PAUSE_SECONDS
             update_index_status(
                 document_id,
-                index_message=f"Esperando cuota de embeddings. Reintento en {wait_seconds} segundos.",
+                index_message=f"Limite temporal de embeddings. Reintento en {wait_seconds} segundos.",
             )
             time.sleep(wait_seconds)
 
@@ -884,6 +891,31 @@ def index_document_sync(document_id: str) -> None:
             index_status="paused",
             index_progress=current_progress,
             index_message="Indexacion pausada por limite diario de embeddings. Se reanudara cuando la cuota se restablezca.",
+            index_error=str(exc),
+            chunk_count=current_chunk_count,
+        )
+    except EmbeddingRateLimitError as exc:
+        current_progress = 0
+        current_chunk_count = 0
+        try:
+            current_doc = (
+                supabase.table("documents")
+                .select("index_progress,chunk_count")
+                .eq("id", document_id)
+                .single()
+                .execute()
+            )
+            current_progress = int((current_doc.data or {}).get("index_progress") or 0)
+            current_chunk_count = int((current_doc.data or {}).get("chunk_count") or 0)
+        except Exception:
+            current_progress = 0
+
+        update_index_status(
+            document_id,
+            status="ready",
+            index_status="paused",
+            index_progress=current_progress,
+            index_message="Indexacion pausada temporalmente por limite de embeddings. Se reintentara mas tarde.",
             index_error=str(exc),
             chunk_count=current_chunk_count,
         )
@@ -1146,6 +1178,13 @@ def general_chat_fallback(message: str) -> str:
     return "Puedo ayudarte con consultas juridicas generales y con la busqueda de informacion dentro de los documentos que has subido."
 
 
+def no_documentary_evidence_answer() -> str:
+    return (
+        "No encontre evidencia suficiente en la base documental para responder esa consulta. "
+        "Prueba con otro nombre, palabra clave o menciona el archivo con @ para analizarlo directamente."
+    )
+
+
 @app.post("/jobs/index-document/{document_id}", response_model=JobResponse, status_code=202)
 async def queue_index_document(
     document_id: str,
@@ -1206,138 +1245,96 @@ async def ask_document(request: ChatRequest):
                 raise
 
         if looks_like_general_chat(request.message):
-            try:
-                prompt = f"Eres SIGED-IA, un asistente juridico experto. Responde de forma breve y natural a esto: {request.message}"
+            return {"answer": general_chat_fallback(request.message), "model": "Saludo", "sources": []}
+
+        try:
+            semantic_matches = search_documents_semantic(
+                request.message,
+                api_key=GOOGLE_BONUS_API_KEY if chat_slot.tier == "bonus" else None,
+            )
+            if semantic_matches:
+                evidence_blocks = build_semantic_evidence_blocks(semantic_matches)
+                prompt = (
+                    "Eres SIGED-IA, un asistente juridico experto. "
+                    "Responde usando solo la evidencia documental suministrada. "
+                    "No inventes datos fuera de los extractos. "
+                    "Si la evidencia es parcial o insuficiente, dilo claramente. "
+                    "Menciona los documentos fuente cuando sustenten la respuesta.\n\n"
+                    f"Pregunta del usuario: {request.message}\n\n"
+                    f"Evidencia documental recuperada por busqueda semantica/hibrida:\n{evidence_blocks}"
+                )
                 if chat_slot.tier == "paid":
                     response, model_name = generate_with_fallback(GENERAL_MODEL_CANDIDATES, prompt)
-                    return {"answer": extract_response_text(response), "model": f"{model_name} (General Mode)", "sources": []}
+                    answer = extract_response_text(response)
+                    model_label = f"{model_name} (RAG Semantico)"
+                else:
+                    answer, model_name = generate_bonus_text_with_fallback(BONUS_GENERAL_MODEL_CANDIDATES, prompt)
+                    answer = prepend_bonus_notice(answer, chat_slot)
+                    model_label = f"{model_name} (Bonus RAG Semantico)"
+                return {
+                    "answer": answer,
+                    "model": model_label,
+                    "sources": dedupe_sources(semantic_matches),
+                }
+        except Exception as exc:
+            if is_quota_error(str(exc)):
+                matches = search_documents_by_text(request.message)
+                return {
+                    "answer": build_text_search_fallback_answer(matches, request.message) if matches else no_documentary_evidence_answer(),
+                    "model": "Busqueda Textual (Respaldo local)",
+                    "sources": [{"id": item["id"], "name": item["name"]} for item in matches],
+                }
 
-                answer, model_name = generate_bonus_text_with_fallback(BONUS_GENERAL_MODEL_CANDIDATES, prompt)
-                return {"answer": prepend_bonus_notice(answer, chat_slot), "model": f"{model_name} (Bonus General Mode)", "sources": []}
-            except Exception as exc:
-                if is_quota_error(str(exc)):
-                    return {"answer": general_chat_fallback(request.message), "model": "Modo General (Respaldo local)", "sources": []}
-                raise
+            print(f"Error en busqueda semantica, usando respaldo textual: {exc}")
 
-        if should_search_knowledge_base(request.message):
+        matches = search_documents_by_text(request.message)
+        if matches:
+            if not any(match["content_match"] for match in matches):
+                return {
+                    "answer": build_name_only_guidance(matches),
+                    "model": "Busqueda Textual",
+                    "sources": [{"id": item["id"], "name": item["name"]} for item in matches],
+                }
+
             try:
-                semantic_matches = search_documents_semantic(
-                    request.message,
-                    api_key=GOOGLE_BONUS_API_KEY if chat_slot.tier == "bonus" else None,
+                evidence_blocks = "\n\n".join(
+                    [f"Documento: {item['name']}\nExtracto: {item['excerpt']}" for item in matches if item["content_match"]]
                 )
-                if semantic_matches:
-                    evidence_blocks = build_semantic_evidence_blocks(semantic_matches)
-                    prompt = (
-                        "Eres SIGED-IA, un asistente juridico experto. "
-                        "Responde usando solo la evidencia documental suministrada. "
-                        "No inventes datos fuera de los extractos. "
-                        "Si la evidencia es parcial o insuficiente, dilo claramente. "
-                        "Menciona los documentos fuente cuando sustenten la respuesta.\n\n"
-                        f"Pregunta del usuario: {request.message}\n\n"
-                        f"Evidencia documental recuperada por busqueda semantica/hibrida:\n{evidence_blocks}"
-                    )
-                    if chat_slot.tier == "paid":
-                        response, model_name = generate_with_fallback(GENERAL_MODEL_CANDIDATES, prompt)
-                        answer = extract_response_text(response)
-                        model_label = f"{model_name} (RAG Semantico)"
-                    else:
-                        answer, model_name = generate_bonus_text_with_fallback(BONUS_GENERAL_MODEL_CANDIDATES, prompt)
-                        answer = prepend_bonus_notice(answer, chat_slot)
-                        model_label = f"{model_name} (Bonus RAG Semantico)"
-                    return {
-                        "answer": answer,
-                        "model": model_label,
-                        "sources": dedupe_sources(semantic_matches),
-                    }
+                prompt = (
+                    "Eres SIGED-IA, un asistente juridico experto. "
+                    "Responde usando solo la evidencia documental suministrada. "
+                    "Si la evidencia no es suficiente, dilo claramente. "
+                    "Indica de forma clara si la informacion aparece o no en la base documental.\n\n"
+                    f"Pregunta del usuario: {request.message}\n\n"
+                    f"Evidencia documental:\n{evidence_blocks}"
+                )
+                if chat_slot.tier == "paid":
+                    response, model_name = generate_with_fallback(GENERAL_MODEL_CANDIDATES, prompt)
+                    answer = extract_response_text(response)
+                    model_label = f"{model_name} (Busqueda Global)"
+                else:
+                    answer, model_name = generate_bonus_text_with_fallback(BONUS_GENERAL_MODEL_CANDIDATES, prompt)
+                    answer = prepend_bonus_notice(answer, chat_slot)
+                    model_label = f"{model_name} (Bonus Busqueda Global)"
+                return {
+                    "answer": answer,
+                    "model": model_label,
+                    "sources": [{"id": item["id"], "name": item["name"]} for item in matches],
+                }
             except Exception as exc:
                 if is_quota_error(str(exc)):
-                    matches = search_documents_by_text(request.message)
                     return {
-                        "answer": build_text_search_fallback_answer(matches, request.message) if matches else general_chat_fallback(request.message),
+                        "answer": build_text_search_fallback_answer(matches, request.message),
                         "model": "Busqueda Textual (Respaldo local)",
                         "sources": [{"id": item["id"], "name": item["name"]} for item in matches],
                     }
-
-                print(f"Error en busqueda semantica, usando respaldo textual: {exc}")
-
-            matches = search_documents_by_text(request.message)
-            if matches:
-                if not any(match["content_match"] for match in matches):
-                    return {
-                        "answer": build_name_only_guidance(matches),
-                        "model": "Busqueda Textual",
-                        "sources": [{"id": item["id"], "name": item["name"]} for item in matches],
-                    }
-
-                try:
-                    evidence_blocks = "\n\n".join(
-                        [f"Documento: {item['name']}\nExtracto: {item['excerpt']}" for item in matches if item["content_match"]]
-                    )
-                    prompt = (
-                        "Eres SIGED-IA, un asistente juridico experto. "
-                        "Responde usando solo la evidencia documental suministrada. "
-                        "Si la evidencia no es suficiente, dilo claramente. "
-                        "Indica de forma clara si la informacion aparece o no en la base documental.\n\n"
-                        f"Pregunta del usuario: {request.message}\n\n"
-                        f"Evidencia documental:\n{evidence_blocks}"
-                    )
-                    if chat_slot.tier == "paid":
-                        response, model_name = generate_with_fallback(GENERAL_MODEL_CANDIDATES, prompt)
-                        answer = extract_response_text(response)
-                        model_label = f"{model_name} (Busqueda Global)"
-                    else:
-                        answer, model_name = generate_bonus_text_with_fallback(BONUS_GENERAL_MODEL_CANDIDATES, prompt)
-                        answer = prepend_bonus_notice(answer, chat_slot)
-                        model_label = f"{model_name} (Bonus Busqueda Global)"
-                    return {
-                        "answer": answer,
-                        "model": model_label,
-                        "sources": [{"id": item["id"], "name": item["name"]} for item in matches],
-                    }
-                except Exception as exc:
-                    if is_quota_error(str(exc)):
-                        return {
-                            "answer": build_text_search_fallback_answer(matches, request.message),
-                            "model": "Busqueda Textual (Respaldo local)",
-                            "sources": [{"id": item["id"], "name": item["name"]} for item in matches],
-                        }
-                    raise
-
-            return {
-                "answer": (
-                    "No se encontraron coincidencias textuales en la base documental para esa consulta. "
-                    "Puedes intentar con otro nombre, palabra clave o usar @ para preguntar por un documento especifico."
-                ),
-                "model": "Busqueda Textual",
-                "sources": [],
-            }
-
-        if looks_like_general_knowledge(request.message):
-            try:
-                prompt = f"Eres SIGED-IA, un asistente juridico experto. Responde de forma clara y breve a esto: {request.message}"
-                if chat_slot.tier == "paid":
-                    response, model_name = generate_with_fallback(GENERAL_MODEL_CANDIDATES, prompt)
-                    return {"answer": extract_response_text(response), "model": f"{model_name} (General Mode)", "sources": []}
-
-                answer, model_name = generate_bonus_text_with_fallback(BONUS_GENERAL_MODEL_CANDIDATES, prompt)
-                return {"answer": prepend_bonus_notice(answer, chat_slot), "model": f"{model_name} (Bonus General Mode)", "sources": []}
-            except Exception as exc:
-                if is_quota_error(str(exc)):
-                    return {"answer": general_chat_fallback(request.message), "model": "Modo General (Respaldo local)", "sources": []}
                 raise
 
-        try:
-            prompt = f"Eres SIGED-IA, un asistente juridico experto. Responde de forma breve y util a esto: {request.message}"
-            if chat_slot.tier == "paid":
-                response, model_name = generate_with_fallback(GENERAL_MODEL_CANDIDATES, prompt)
-                return {"answer": extract_response_text(response), "model": f"{model_name} (General Mode)", "sources": []}
-
-            answer, model_name = generate_bonus_text_with_fallback(BONUS_GENERAL_MODEL_CANDIDATES, prompt)
-            return {"answer": prepend_bonus_notice(answer, chat_slot), "model": f"{model_name} (Bonus General Mode)", "sources": []}
-        except Exception as exc:
-            if is_quota_error(str(exc)):
-                return {"answer": general_chat_fallback(request.message), "model": "Modo General (Respaldo local)", "sources": []}
-            raise
+        return {
+            "answer": no_documentary_evidence_answer(),
+            "model": "Busqueda Documental",
+            "sources": [],
+        }
 
     except TimeoutError as e:
         raise HTTPException(

@@ -82,6 +82,18 @@ CHAT_PATTERNS = (
     "como estas", "quien eres", "que haces", "ayudame", "gracias", "ok", "okay"
 )
 
+ASSISTANT_IDENTITY_HINTS = (
+    "quien eres",
+    "para que sirves",
+    "que puedes hacer",
+    "como funcionas",
+    "como me ayudas",
+    "que haces",
+    "cual es tu funcion",
+    "cual es tu proposito",
+    "que eres",
+)
+
 SEARCH_HINTS = (
     "base de conocimiento", "en algun documento", "en algún documento", "en que documento",
     "en qué documento", "se menciona", "se habla de", "donde se habla", "dónde se habla",
@@ -248,6 +260,11 @@ def extract_retry_delay_seconds(message: str) -> Optional[int]:
 def looks_like_general_chat(message: str) -> bool:
     normalized = normalize_text(message).strip(" ?!.,")
     return normalized in CHAT_PATTERNS
+
+
+def looks_like_assistant_identity_question(message: str) -> bool:
+    normalized = normalize_text(message)
+    return any(hint in normalized for hint in ASSISTANT_IDENTITY_HINTS)
 
 
 def looks_like_general_knowledge(message: str) -> bool:
@@ -1238,8 +1255,11 @@ def general_chat_fallback(message: str) -> str:
     normalized = normalize_text(message).strip(" ?!.,")
     if normalized in ("hola", "hello", "helloo", "buenas", "buenos dias", "buenas tardes", "buenas noches"):
         return "Hola. Soy DocBrain, tu asistente juridico. Puedo ayudarte con preguntas generales o buscar informacion dentro de tus documentos."
-    if normalized == "quien eres":
-        return "Soy DocBrain, un asistente juridico para consultar documentos y responder preguntas basadas en tu base documental."
+    if looks_like_assistant_identity_question(message):
+        return (
+            "Soy DocBrain, un asistente juridico orientado a consulta documental. "
+            "Sirvo para ayudarte a buscar informacion en tu base documental, analizar archivos concretos y responder con base en evidencia."
+        )
     return "Puedo ayudarte con consultas juridicas generales y con la busqueda de informacion dentro de los documentos que has subido."
 
 
@@ -1342,7 +1362,7 @@ async def ask_document(request: ChatRequest):
                     )
                 raise
 
-        if looks_like_general_chat(request.message):
+        if looks_like_general_chat(request.message) or looks_like_assistant_identity_question(request.message):
             return {"answer": general_chat_fallback(request.message), "model": "Saludo", "sources": []}
 
         try:

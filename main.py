@@ -106,6 +106,18 @@ GENERAL_KNOWLEDGE_HINTS = (
     "puedes decirme que es", "puedes decirme qué es", "explicame", "explícame", "define"
 )
 
+NAMED_ENTITY_QUERY_PREFIXES = (
+    "quien es ",
+    "quien fue ",
+    "quien era ",
+    "que es ",
+    "que significa ",
+    "hablame de ",
+    "hablame sobre ",
+    "que sabes de ",
+    "dime sobre ",
+)
+
 STRUCTURAL_QUERY_HINTS = (
     "indice", "tabla de contenido", "capitulo", "seccion", "pagina",
     "resumen", "partes", "estructura", "apartados", "contenido"
@@ -270,6 +282,21 @@ def looks_like_assistant_identity_question(message: str) -> bool:
 def looks_like_general_knowledge(message: str) -> bool:
     normalized = normalize_text(message)
     return any(hint in normalized for hint in GENERAL_KNOWLEDGE_HINTS)
+
+
+def looks_like_named_entity_query(message: str) -> bool:
+    normalized = normalize_text(message).strip(" ?!.,")
+    return any(normalized.startswith(prefix) for prefix in NAMED_ENTITY_QUERY_PREFIXES)
+
+
+def extract_query_focus_text(message: str) -> str:
+    normalized = normalize_text(message).strip(" ?!.,")
+
+    for prefix in NAMED_ENTITY_QUERY_PREFIXES:
+        if normalized.startswith(prefix):
+            return normalized[len(prefix):].strip()
+
+    return normalized
 
 
 def should_search_knowledge_base(message: str) -> bool:
@@ -515,6 +542,11 @@ def get_mime_type(file_path: str, file_name: str) -> str:
     return guessed or "application/octet-stream"
 
 
+def supports_native_document_file_mode(file_name: str) -> bool:
+    lower_name = (file_name or "").lower()
+    return lower_name.endswith((".pdf", ".png", ".jpg", ".jpeg"))
+
+
 def extract_rest_error_message(response: requests.Response) -> str:
     try:
         payload = response.json()
@@ -653,6 +685,31 @@ def generate_bonus_document_with_fallback(file_path: str, display_name: str, pro
                 continue
 
     raise last_error or RuntimeError("No se pudo generar respuesta bonus de documento.")
+
+
+def generate_document_text_answer_with_failover(doc_data: dict, user_message: str, chat_slot: ChatUsageReservation) -> tuple[str, str]:
+    temp_path = download_document_to_temp(doc_data)
+
+    try:
+        pages = extract_document_pages(temp_path, doc_data.get("name", "Documento"))
+        extracted_text = build_document_preview_text(pages, max_chars=18000)
+    finally:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+
+    if not extracted_text.strip():
+        raise RuntimeError("No se pudo extraer texto utilizable del documento mencionado.")
+
+    prompt = (
+        "Eres DocBrain, asistente legal experto. "
+        "Responde basandote unicamente en el contenido extraido del documento. "
+        "Si la evidencia es insuficiente, dilo claramente. "
+        "Si la pregunta es general, resume el contenido principal del documento en lenguaje claro.\n\n"
+        f"Documento: {doc_data.get('name', 'Documento')}\n\n"
+        f"Contenido extraido:\n{extracted_text}\n\n"
+        f"Pregunta: {user_message}"
+    )
+    return generate_text_answer_with_failover(prompt, chat_slot, "Doc Text Mode")
 
 
 def update_index_status(document_id: str, **updates) -> None:
@@ -1166,6 +1223,84 @@ def enrich_chunk_matches(matches: list[dict]) -> list[dict]:
     return enriched
 
 
+def score_match_against_query(content: str, document_name: str, query: str) -> int:
+    normalized_content = normalize_text(content)
+    normalized_name = normalize_text(document_name)
+    focus_text = extract_query_focus_text(query)
+    focus_terms = extract_terms(focus_text or query)
+
+    phrase_score = 0
+    if focus_text and len(focus_text) >= 3:
+        phrase_score += normalized_content.count(focus_text) * 28
+        phrase_score += normalized_name.count(focus_text) * 42
+
+    content_term_hits = sum(normalized_content.count(term) for term in focus_terms)
+    name_term_hits = sum(normalized_name.count(term) for term in focus_terms)
+    all_terms_present = bool(focus_terms) and all(term in normalized_content or term in normalized_name for term in focus_terms)
+
+    return phrase_score + (content_term_hits * 5) + (name_term_hits * 12) + (24 if all_terms_present else 0)
+
+
+def rerank_matches_for_query(matches: list[dict], query: str) -> list[dict]:
+    ranked = []
+
+    for match in matches:
+        ranked.append({
+            **match,
+            "query_score": score_match_against_query(match.get("content", ""), match.get("name", ""), query),
+        })
+
+    ranked.sort(key=lambda item: (item.get("query_score", 0), float(item.get("similarity") or 0)), reverse=True)
+    return ranked
+
+
+def merge_ranked_matches(primary: list[dict], secondary: list[dict], max_count: int = 8) -> list[dict]:
+    merged: list[dict] = []
+    seen_keys: set[tuple[str, str]] = set()
+
+    for match in [*primary, *secondary]:
+        document_id = str(match.get("document_id") or "")
+        content = str(match.get("content") or "")
+        key = (document_id, content)
+        if not document_id or key in seen_keys:
+            continue
+        seen_keys.add(key)
+        merged.append(match)
+        if len(merged) >= max_count:
+            break
+
+    return merged
+
+
+def search_document_chunks_by_text(query: str, match_count: int = 8) -> list[dict]:
+    terms = extract_terms(extract_query_focus_text(query) or query)
+    if not terms:
+        return []
+
+    response = supabase.table("document_chunks").select("id,document_id,content").limit(600).execute()
+    chunks = response.data or []
+    ranked = []
+
+    for chunk in chunks:
+        content = chunk.get("content") or ""
+        normalized_content = normalize_text(content)
+        term_hits = sum(normalized_content.count(term) for term in terms)
+
+        if term_hits <= 0:
+            continue
+
+        ranked.append({
+            "id": chunk.get("id"),
+            "document_id": chunk.get("document_id"),
+            "content": content,
+            "similarity": float(term_hits),
+        })
+
+    ranked.sort(key=lambda item: item["similarity"], reverse=True)
+    enriched = enrich_chunk_matches(ranked[: max(match_count * 2, match_count)])
+    return rerank_matches_for_query(enriched, query)[:match_count]
+
+
 def search_documents_semantic(query: str, match_count: int = 8, api_key: Optional[str] = None) -> list[dict]:
     query_embedding = embed_query_with_fallback(
         query,
@@ -1285,13 +1420,24 @@ def generate_text_answer_with_failover(prompt: str, chat_slot: ChatUsageReservat
         raise
 
 
-def generate_document_answer_with_failover(document_id: str, prompt: str, chat_slot: ChatUsageReservation) -> tuple[str, str]:
+def generate_document_answer_with_failover(document_id: str, user_message: str, chat_slot: ChatUsageReservation) -> tuple[str, str]:
+    doc_record = supabase.table("documents").select("id,name,file_path").eq("id", document_id).single().execute()
+    doc_data = doc_record.data or {}
+    doc_name = doc_data.get("name", "Documento")
+    prompt = (
+        "Eres DocBrain, asistente legal experto. "
+        "Responde basandote unicamente en este documento. "
+        "Si la pregunta es general, resume el contenido principal del documento en lenguaje claro.\n"
+        f"Pregunta: {user_message}"
+    )
+
+    if not supports_native_document_file_mode(doc_name):
+        return generate_document_text_answer_with_failover(doc_data, user_message, chat_slot)
+
     if chat_slot.tier == "bonus":
-        doc_record = supabase.table("documents").select("id,name,file_path").eq("id", document_id).single().execute()
-        doc_data = doc_record.data or {}
         temp_path = download_document_to_temp(doc_data)
         try:
-            answer, model_name = generate_bonus_document_with_fallback(temp_path, doc_data.get("name", "Documento"), prompt)
+            answer, model_name = generate_bonus_document_with_fallback(temp_path, doc_name, prompt)
         finally:
             if os.path.exists(temp_path):
                 os.remove(temp_path)
@@ -1302,14 +1448,15 @@ def generate_document_answer_with_failover(document_id: str, prompt: str, chat_s
         response, model_name = generate_with_fallback(DOC_MODEL_CANDIDATES, [google_file, prompt])
         return extract_response_text(response), f"{model_name} (Doc Mode)"
     except Exception as exc:
+        if "unsupported mime type" in normalize_text(str(exc)):
+            return generate_document_text_answer_with_failover(doc_data, user_message, chat_slot)
+
         if not (can_use_bonus_failover() and is_failover_eligible_error(str(exc))):
             raise
 
-        doc_record = supabase.table("documents").select("id,name,file_path").eq("id", document_id).single().execute()
-        doc_data = doc_record.data or {}
         temp_path = download_document_to_temp(doc_data)
         try:
-            answer, model_name = generate_bonus_document_with_fallback(temp_path, doc_data.get("name", "Documento"), prompt)
+            answer, model_name = generate_bonus_document_with_fallback(temp_path, doc_name, prompt)
         finally:
             if os.path.exists(temp_path):
                 os.remove(temp_path)
@@ -1342,17 +1489,14 @@ async def queue_index_pending(
 @app.post("/ask")
 async def ask_document(request: ChatRequest):
     try:
+        if looks_like_general_chat(request.message) or looks_like_assistant_identity_question(request.message):
+            return {"answer": general_chat_fallback(request.message), "model": "Saludo", "sources": []}
+
         chat_slot = reserve_daily_google_request_budget(request)
 
         if request.document_id:
             try:
-                prompt = (
-                    "Eres DocBrain, asistente legal experto. "
-                    "Responde basandote unicamente en este documento. "
-                    "Si la pregunta es general, resume el contenido principal del documento en lenguaje claro.\n"
-                    f"Pregunta: {request.message}"
-                )
-                answer, model_name = generate_document_answer_with_failover(request.document_id, prompt, chat_slot)
+                answer, model_name = generate_document_answer_with_failover(request.document_id, request.message, chat_slot)
                 return {"answer": answer, "model": model_name}
             except Exception as exc:
                 if is_quota_error(str(exc)):
@@ -1362,11 +1506,16 @@ async def ask_document(request: ChatRequest):
                     )
                 raise
 
-        if looks_like_general_chat(request.message) or looks_like_assistant_identity_question(request.message):
-            return {"answer": general_chat_fallback(request.message), "model": "Saludo", "sources": []}
-
         try:
             semantic_matches, semantic_mode = search_documents_semantic_with_failover(request.message, chat_slot)
+            if looks_like_named_entity_query(request.message):
+                chunk_text_matches = search_document_chunks_by_text(request.message, match_count=6)
+                semantic_matches = merge_ranked_matches(
+                    chunk_text_matches,
+                    rerank_matches_for_query(semantic_matches, request.message),
+                    max_count=8,
+                )
+
             if semantic_matches:
                 evidence_blocks = build_semantic_evidence_blocks(semantic_matches)
                 prompt = (
@@ -1398,6 +1547,37 @@ async def ask_document(request: ChatRequest):
                 }
 
             print(f"Error en busqueda semantica, usando respaldo textual: {exc}")
+
+        if looks_like_named_entity_query(request.message):
+            chunk_matches = search_document_chunks_by_text(request.message, match_count=6)
+            if chunk_matches:
+                try:
+                    evidence_blocks = build_semantic_evidence_blocks(chunk_matches)
+                    prompt = (
+                        "Eres DocBrain, un asistente juridico experto. "
+                        "Responde usando solo la evidencia documental suministrada. "
+                        "Prioriza coincidencias exactas de nombres propios cuando aparezcan en los extractos. "
+                        "Si la evidencia no es suficiente, dilo claramente.\n\n"
+                        f"Pregunta del usuario: {request.message}\n\n"
+                        f"Evidencia documental recuperada por coincidencia textual en fragmentos:\n{evidence_blocks}"
+                    )
+                    answer, model_label = generate_text_answer_with_failover(prompt, chat_slot, "Busqueda por entidad")
+                    return {
+                        "answer": answer,
+                        "model": model_label,
+                        "sources": dedupe_sources(chunk_matches),
+                    }
+                except Exception as exc:
+                    if is_quota_error(str(exc)):
+                        return {
+                            "answer": build_text_search_fallback_answer(
+                                [{"id": item["document_id"], "name": item["name"], "excerpt": item["content"]} for item in chunk_matches],
+                                request.message,
+                            ),
+                            "model": "Busqueda Textual (Respaldo local)",
+                            "sources": dedupe_sources(chunk_matches),
+                        }
+                    raise
 
         matches = search_documents_by_text(request.message)
         if matches:

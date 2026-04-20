@@ -704,6 +704,7 @@ def generate_document_text_answer_with_failover(doc_data: dict, user_message: st
         "Eres DocBrain, asistente legal experto. "
         "Responde basandote unicamente en el contenido extraido del documento. "
         "Si la evidencia es insuficiente, dilo claramente. "
+        "Puedes entabalar una conversacion normal. "
         "Si la pregunta es general, resume el contenido principal del documento en lenguaje claro.\n\n"
         f"Documento: {doc_data.get('name', 'Documento')}\n\n"
         f"Contenido extraido:\n{extracted_text}\n\n"
